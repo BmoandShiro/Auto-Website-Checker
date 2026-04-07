@@ -45,7 +45,8 @@ from PyQt6.QtWidgets import (
 from main import QA_ROW_OPTIONS, CheckResult, build_results
 
 
-SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "settings.json")
+APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".auto_website_checker")
+SETTINGS_PATH = os.path.join(APP_DATA_DIR, "settings.json")
 DEFAULT_SETTINGS = {
     "timeout_seconds": 30,
     "max_links_per_check": 30,
@@ -58,7 +59,7 @@ DEFAULT_SETTINGS = {
     "expected_business_name": "",
     "ui_font_size": 10,
     "auto_save_last_run": True,
-    "results_history_dir": os.path.join(os.path.dirname(__file__), "run-history"),
+    "results_history_dir": os.path.join(APP_DATA_DIR, "run-history"),
 }
 
 
@@ -434,6 +435,7 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _load_settings(self) -> dict:
+        os.makedirs(APP_DATA_DIR, exist_ok=True)
         if not os.path.exists(SETTINGS_PATH):
             return dict(DEFAULT_SETTINGS)
         try:
@@ -446,6 +448,7 @@ class MainWindow(QMainWindow):
             return dict(DEFAULT_SETTINGS)
 
     def _save_settings(self) -> None:
+        os.makedirs(APP_DATA_DIR, exist_ok=True)
         with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
             json.dump(self.settings, f, indent=2)
 
