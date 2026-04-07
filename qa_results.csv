@@ -1,9 +1,15 @@
 QA Component,Y/N,Desktop Pass/Fail,Mobile Pass/Fail,Tablet Pass/Fail,Notes
 If Inheriting an Exiting Website: Is it a passable design?,TBD,Manual,Manual,Manual,Manual visual/brand quality review required per device.
-Fast website/page load speed (Does it feel fast/snappy?),Yes,Pass,Pass,Pass,"Avg load ms across 1 page(s): desktop=215, mobile=201, tablet=205"
+Fast website/page load speed (Does it feel fast/snappy?),Yes,Pass,Pass,Pass,"Avg load ms across 1 page(s): desktop=254, mobile=177, tablet=218"
 Navigation bar functionality - responsive menu bar,No,Fail,Fail,Fail,D:Nav failed on page(s): https://example.com | M:Nav failed on page(s): https://example.com | T:Nav failed on page(s): https://example.com
 Working links & buttons,Yes,Pass,Pass,Pass,D:1 pages checked; link-check failures on 0 page(s) | M:1 pages checked; link-check failures on 0 page(s) | T:1 pages checked; link-check failures on 0 page(s)
 Phone Number Present in Head (NOT Only Book Online),No,Fail,Fail,Fail,D:Phone missing on: https://example.com (No phone detected in header/top-nav area) | M:Phone missing on: https://example.com (No phone detected in header/top-nav area) | T:Phone missing on: https://example.com (No phone detected in header/top-nav area)
 Footer functionality - working links,No,Fail,Fail,Fail,D:1 pages checked; footer failures:  | M:1 pages checked; footer failures:  | T:1 pages checked; footer failures: 
+"Correct spelling & grammar, no typos",No,Fail,Fail,Fail,Insufficient textual content for automated check
+"Images are compressed, high resolution, not blurry or pixelated",No,Fail,Fail,Fail,Heuristic image-quality check. No image URLs found
+Videos load correctly,No,Fail,Fail,Fail,Source-reachability check. No video/iframe sources found
+Social media links out to correct pages,No,Fail,Fail,Fail,Reachability + name-token hint (not ownership-proof). No social links found; ownership correctness not verifiable without expected business name; conflicts=none
+Search Engine Visibility NOT Checked to Discourage Indexing,No,Fail,Fail,Fail,No noindex/meta robots block found
+Using correct business name,No,Fail,Fail,Fail,No expected business name provided
 Rise Plugin Compatible (Wordpress),No,Fail,Fail,Fail,No WordPress markers found
-Core Web Vitals,No,Fail,Fail,Fail,Desktop Skipped (Core Web Vitals disabled in Settings); Mobile/Tablet Skipped (Core Web Vitals disabled in Settings); pages_audited=1
+Core Web Vitals,TBD,Manual,Manual,Manual,Desktop Skipped (Core Web Vitals disabled in Settings); Mobile/Tablet Skipped (Core Web Vitals disabled in Settings); pages_audited=1

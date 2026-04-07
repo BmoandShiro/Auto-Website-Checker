@@ -6,5 +6,6 @@
   "psi_cooldown_seconds": 3.0,
   "request_throttle_seconds": 0.5,
   "prefer_crux_first": true,
-  "enable_core_web_vitals": false
+  "enable_core_web_vitals": false,
+  "expected_business_name": "Renew Dental Loft"
 }

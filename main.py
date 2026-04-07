@@ -9,8 +9,10 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 import time
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 from urllib.error import HTTPError, URLError
@@ -248,6 +250,57 @@ def extract_crux_pass(payload: Dict[str, object]) -> Tuple[bool, str]:
     return passed, note
 
 
+def run_local_lighthouse_cwv(url: str, strategy: str, timeout_s: int = 120) -> Tuple[bool, str]:
+    # Free fallback when PSI/CrUX are unavailable or throttled.
+    form_factor = "desktop" if strategy == "desktop" else "mobile"
+    command = [
+        "npx",
+        "-y",
+        "lighthouse",
+        url,
+        "--quiet",
+        "--chrome-flags=--headless=new",
+        "--only-categories=performance",
+        f"--form-factor={form_factor}",
+        "--output=json",
+        "--output-path=stdout",
+    ]
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=timeout_s, check=True)
+    except FileNotFoundError:
+        return False, "Lighthouse unavailable (npx not found)"
+    except subprocess.TimeoutExpired:
+        return False, "Lighthouse timeout"
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        return False, f"Lighthouse failed: {stderr[:200] if stderr else 'unknown error'}"
+
+    try:
+        payload = json.loads(proc.stdout)
+        audits = payload.get("audits", {})
+        perf_score = payload.get("categories", {}).get("performance", {}).get("score")
+        lcp = audits.get("largest-contentful-paint", {}).get("numericValue")
+        cls = audits.get("cumulative-layout-shift", {}).get("numericValue")
+        inp = audits.get("interaction-to-next-paint", {}).get("numericValue")
+        tbt = audits.get("total-blocking-time", {}).get("numericValue")
+
+        # CWV-style pass thresholds (lab fallback):
+        # LCP <= 2500ms, CLS <= 0.1, and INP <= 200ms if present; else TBT <= 200ms proxy.
+        if lcp is None or cls is None:
+            return False, "Lighthouse missing required metrics"
+        inp_or_tbt_ok = (inp is not None and inp <= 200) or (inp is None and tbt is not None and tbt <= 200)
+        passed = lcp <= 2500 and cls <= 0.1 and inp_or_tbt_ok
+        score_note = f"score={int(float(perf_score) * 100)}" if isinstance(perf_score, (int, float)) else "score=n/a"
+        detail = f"Lighthouse {score_note} lcp={int(lcp)}ms cls={cls:.3f}"
+        if inp is not None:
+            detail += f" inp={int(inp)}ms"
+        elif tbt is not None:
+            detail += f" tbt={int(tbt)}ms(proxy)"
+        return passed, detail
+    except Exception as exc:
+        return False, f"Lighthouse parse error: {exc}"
+
+
 def extract_core_web_vitals_pass(payload: Dict[str, object]) -> Tuple[bool, str]:
     loading = payload.get("loadingExperience", {})
     if isinstance(loading, dict):
@@ -324,6 +377,203 @@ def detect_wordpress(url: str) -> Tuple[bool, str]:
         return False, "No WordPress markers found"
     except Exception:
         return False, "Unable to confirm WordPress markers"
+
+
+def fetch_html(url: str) -> str:
+    req = Request(url, headers={"User-Agent": USER_AGENT})
+    with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def check_social_links(url: str, html: str) -> Tuple[bool, str]:
+    social_domains = ("facebook.com", "instagram.com", "linkedin.com", "x.com", "twitter.com", "youtube.com", "tiktok.com")
+    hrefs = re.findall(r'href\s*=\s*["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    links = normalize_links(url, hrefs)
+    socials = [l for l in links if any(domain in l.lower() for domain in social_domains)]
+    if not socials:
+        return False, "No social links found"
+    ok, note, failures = check_link_set(socials, max_to_check=20)
+    if ok:
+        return True, f"Checked {len(socials)} social link(s), all OK"
+    return False, f"{note}; failures={', '.join(failures[:5])}"
+
+
+def _social_platform(url: str) -> str:
+    lower = url.lower()
+    if "facebook.com" in lower:
+        return "facebook"
+    if "instagram.com" in lower:
+        return "instagram"
+    if "linkedin.com" in lower:
+        return "linkedin"
+    if "x.com" in lower or "twitter.com" in lower:
+        return "x/twitter"
+    if "youtube.com" in lower:
+        return "youtube"
+    if "tiktok.com" in lower:
+        return "tiktok"
+    return "other"
+
+
+def _social_account_key(link: str) -> str:
+    parsed = urlparse(link)
+    path = parsed.path.strip("/").lower()
+    if not path:
+        return parsed.netloc.lower()
+    first_segment = path.split("/")[0]
+    query = parsed.query.lower()
+    if first_segment == "profile.php" and query:
+        return f"{first_segment}?{query}"
+    return first_segment
+
+
+def get_social_link_inventory(url: str, html: str) -> Tuple[List[Dict[str, str]], List[str]]:
+    hrefs = re.findall(r'href\s*=\s*["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    links = normalize_links(url, hrefs)
+    social_domains = ("facebook.com", "instagram.com", "linkedin.com", "x.com", "twitter.com", "youtube.com", "tiktok.com")
+    socials = [l for l in links if any(domain in l.lower() for domain in social_domains)]
+    inventory: List[Dict[str, str]] = []
+    platform_accounts: Dict[str, set] = {}
+    for link in socials:
+        platform = _social_platform(link)
+        account_key = _social_account_key(link)
+        platform_accounts.setdefault(platform, set()).add(account_key)
+        inventory.append({"platform": platform, "url": link, "account_key": account_key})
+    conflicts = [p for p, accounts in platform_accounts.items() if len(accounts) > 1]
+    return inventory, conflicts
+
+
+def check_social_links_with_business_hint(url: str, html: str, expected_business_name: str) -> Tuple[bool, str]:
+    ok, note = check_social_links(url, html)
+    if not expected_business_name.strip():
+        return ok, f"{note}; ownership correctness not verifiable without expected business name"
+    tokens = [t.lower() for t in re.findall(r"[a-zA-Z0-9]+", expected_business_name) if len(t) >= 4]
+    hrefs = re.findall(r'href\s*=\s*["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    links = normalize_links(url, hrefs)
+    social_domains = ("facebook.com", "instagram.com", "linkedin.com", "x.com", "twitter.com", "youtube.com", "tiktok.com")
+    socials = [l for l in links if any(domain in l.lower() for domain in social_domains)]
+    if not socials:
+        return False, f"{note}; no social URLs to compare with business name"
+    if not tokens:
+        return ok, f"{note}; expected business name has no strong tokens"
+    token_matches = 0
+    for link in socials:
+        lower = link.lower()
+        if any(token in lower for token in tokens):
+            token_matches += 1
+    return ok, f"{note}; name-token matches on {token_matches}/{len(socials)} social URLs"
+
+
+def check_noindex_discouraged(url: str, html: str) -> Tuple[bool, str]:
+    lower = html.lower()
+    if 'name="robots"' in lower and "noindex" in lower:
+        return True, "Meta robots contains noindex"
+    robots_url = urljoin(url, "/robots.txt")
+    try:
+        req = Request(robots_url, headers={"User-Agent": USER_AGENT})
+        with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+            robots = resp.read().decode("utf-8", errors="replace").lower()
+        if "disallow: /" in robots:
+            return True, "robots.txt contains Disallow: /"
+    except Exception:
+        pass
+    return False, "No noindex/meta robots block found"
+
+
+def extract_visible_text(html: str) -> str:
+    # Remove script/style/HTML tags with lightweight regex cleanup.
+    text = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.IGNORECASE)
+    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def check_spelling_grammar(pages_html: List[str]) -> Tuple[bool, str]:
+    sample_text = " ".join(extract_visible_text(h) for h in pages_html if h)
+    words = re.findall(r"\b[a-zA-Z]{4,}\b", sample_text)
+    if len(words) < 40:
+        return False, "Insufficient textual content for automated check"
+    try:
+        from spellchecker import SpellChecker  # type: ignore
+    except Exception:
+        return False, "Spell checker package unavailable (install pyspellchecker)"
+
+    spell = SpellChecker()
+    # limit sample for speed on very large pages
+    subset = [w.lower() for w in words[:3000]]
+    unknown = spell.unknown(subset)
+    error_rate = (len(unknown) / max(1, len(set(subset)))) * 100
+    passed = error_rate <= 3.0
+    return passed, f"Spelling heuristic unknown-word rate={error_rate:.1f}% (threshold<=3.0%)"
+
+
+def check_image_quality(url: str, pages_html: List[str]) -> Tuple[bool, str]:
+    try:
+        from PIL import Image, ImageFilter, ImageStat  # type: ignore
+        from io import BytesIO
+    except Exception:
+        return False, "Pillow unavailable (install pillow)"
+
+    srcs: List[str] = []
+    for html in pages_html:
+        srcs.extend(re.findall(r'<img[^>]+src\s*=\s*["\']([^"\']+)["\']', html, flags=re.IGNORECASE))
+    image_urls = normalize_links(url, srcs)[:20]
+    if not image_urls:
+        return False, "No image URLs found"
+
+    checked = 0
+    blurry = 0
+    low_res = 0
+    for img_url in image_urls:
+        try:
+            req = Request(img_url, headers={"User-Agent": USER_AGENT})
+            with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+                data = resp.read()
+            img = Image.open(BytesIO(data)).convert("L")
+            w, h = img.size
+            checked += 1
+            if w < 300 or h < 200:
+                low_res += 1
+            edges = img.filter(ImageFilter.FIND_EDGES)
+            var = ImageStat.Stat(edges).var[0]
+            if var < 60:
+                blurry += 1
+        except Exception:
+            continue
+    if checked == 0:
+        return False, "Could not analyze images"
+    passed = (blurry / checked) <= 0.4 and (low_res / checked) <= 0.5
+    return passed, f"Checked {checked} images; blurry={blurry}, low_res={low_res}"
+
+
+def check_videos_load(url: str, pages_html: List[str]) -> Tuple[bool, str]:
+    srcs: List[str] = []
+    for html in pages_html:
+        srcs.extend(re.findall(r"<video[^>]+src\s*=\s*['\"]([^'\"]+)['\"]", html, flags=re.IGNORECASE))
+        srcs.extend(re.findall(r"<source[^>]+src\s*=\s*['\"]([^'\"]+)['\"]", html, flags=re.IGNORECASE))
+        srcs.extend(re.findall(r"<iframe[^>]+src\s*=\s*['\"]([^'\"]+)['\"]", html, flags=re.IGNORECASE))
+    video_urls = normalize_links(url, srcs)[:20]
+    if not video_urls:
+        return False, "No video/iframe sources found"
+    ok, note, failures = check_link_set(video_urls, max_to_check=20)
+    if ok:
+        return True, f"Checked {len(video_urls)} video source URL(s), all reachable"
+    return False, f"{note}; failures={', '.join(failures[:5])}"
+
+
+def check_business_name(pages_html: List[str], expected_business_name: str) -> Tuple[bool, str]:
+    expected = expected_business_name.strip()
+    if not expected:
+        return False, "No expected business name provided"
+    needle = expected.lower()
+    hits = 0
+    for html in pages_html:
+        text = extract_visible_text(html).lower()
+        if needle in text:
+            hits += 1
+    passed = hits >= 1
+    return passed, f"Exact name match found on {hits}/{len(pages_html)} checked page(s)"
 
 
 def detect_phone_in_header(page: Page) -> Tuple[bool, str]:
@@ -552,7 +802,9 @@ def build_results(
     max_pages: int = MAX_PAGES_TO_AUDIT,
     on_row=None,
     on_status=None,
-    on_progress=None,
+    on_social_links=None,
+    on_progress_non_cwv=None,
+    on_progress_cwv=None,
     settings: Dict[str, object] | None = None,
 ) -> List[CheckResult]:
     apply_runtime_settings(settings)
@@ -568,35 +820,36 @@ def build_results(
         if on_row:
             on_row(row)
 
-    progress_total = 1
-    progress_done = 0
+    non_cwv_total = 1
+    non_cwv_done = 0
+    cwv_total = 1
+    cwv_done = 0
 
-    def init_progress(total: int) -> None:
-        nonlocal progress_total, progress_done
-        progress_total = max(1, total)
-        progress_done = 0
-        if on_progress:
-            on_progress(0, progress_total)
+    def init_non_cwv(total: int) -> None:
+        nonlocal non_cwv_total, non_cwv_done
+        non_cwv_total = max(1, total)
+        non_cwv_done = 0
+        if on_progress_non_cwv:
+            on_progress_non_cwv(0, non_cwv_total)
 
-    def step_progress() -> None:
-        nonlocal progress_done
-        progress_done += 1
-        if on_progress:
-            on_progress(min(progress_done, progress_total), progress_total)
+    def step_non_cwv() -> None:
+        nonlocal non_cwv_done
+        non_cwv_done += 1
+        if on_progress_non_cwv:
+            on_progress_non_cwv(min(non_cwv_done, non_cwv_total), non_cwv_total)
 
-    emit_status("Discovering internal pages...")
-    pages = discover_internal_pages(url, max_pages=max_pages)
-    cwv_steps = 2 if ENABLE_CORE_WEB_VITALS else 0
-    total_steps = 1 + (len(pages) * len(DEVICE_PROFILES)) + cwv_steps + 8
-    init_progress(total_steps)
-    step_progress()
-    emit_status(f"Auditing {len(pages)} page(s) across desktop/mobile/tablet...")
-    audits = run_device_audits(pages, on_audit_complete=step_progress)
+    def init_cwv(total: int) -> None:
+        nonlocal cwv_total, cwv_done
+        cwv_total = max(1, total)
+        cwv_done = 0
+        if on_progress_cwv:
+            on_progress_cwv(0, cwv_total)
 
-    desktop = audits["desktop"]
-    mobile = audits["mobile"]
-    tablet = audits["tablet"]
-    is_wp, wp_note = detect_wordpress(url)
+    def step_cwv() -> None:
+        nonlocal cwv_done
+        cwv_done += 1
+        if on_progress_cwv:
+            on_progress_cwv(min(cwv_done, cwv_total), cwv_total)
 
     desktop_cwv_ok, desktop_cwv_note = False, "Unavailable"
     mobile_cwv_ok, mobile_cwv_note = False, "Unavailable"
@@ -629,28 +882,76 @@ def build_results(
                 ok, note = extract_crux_pass(crux_payload)
                 return ok, f"{psi_error}; fallback=CrUX {note}"
             except (HTTPError, URLError, ValueError, KeyError) as exc:
-                return False, f"{psi_error}; CrUX error: {exc}"
+                lighthouse_ok, lighthouse_note = run_local_lighthouse_cwv(url, strategy)
+                return lighthouse_ok, f"{psi_error}; CrUX error: {exc}; fallback={lighthouse_note}"
 
         if crux_error:
-            return False, f"{crux_error}; {psi_error}"
-        return False, psi_error or "CWV unavailable"
+            lighthouse_ok, lighthouse_note = run_local_lighthouse_cwv(url, strategy)
+            return lighthouse_ok, f"{crux_error}; {psi_error}; fallback={lighthouse_note}"
+        lighthouse_ok, lighthouse_note = run_local_lighthouse_cwv(url, strategy)
+        return lighthouse_ok, f"{psi_error or 'CWV unavailable'}; fallback={lighthouse_note}"
 
-    if ENABLE_CORE_WEB_VITALS:
-        emit_status("Checking Core Web Vitals (desktop)...")
-        desktop_cwv_ok, desktop_cwv_note = evaluate_cwv("desktop", "DESKTOP")
-        step_progress()
+    init_cwv(2 if ENABLE_CORE_WEB_VITALS else 1)
 
-        # Cool down between PSI calls to reduce API throttling.
-        time.sleep(PSI_COOLDOWN_SECONDS)
+    def run_cwv_flow() -> None:
+        nonlocal desktop_cwv_ok, desktop_cwv_note, mobile_cwv_ok, mobile_cwv_note
+        if ENABLE_CORE_WEB_VITALS:
+            emit_status("Checking Core Web Vitals (desktop)...")
+            desktop_cwv_ok, desktop_cwv_note = evaluate_cwv("desktop", "DESKTOP")
+            step_cwv()
 
-        emit_status("Checking Core Web Vitals (mobile/tablet)...")
-        mobile_cwv_ok, mobile_cwv_note = evaluate_cwv("mobile", "PHONE")
-        step_progress()
-    else:
-        desktop_cwv_ok, desktop_cwv_note = False, "Skipped (Core Web Vitals disabled in Settings)"
-        mobile_cwv_ok, mobile_cwv_note = False, "Skipped (Core Web Vitals disabled in Settings)"
+            # Cool down between PSI calls to reduce API throttling.
+            time.sleep(PSI_COOLDOWN_SECONDS)
+
+            emit_status("Checking Core Web Vitals (mobile/tablet)...")
+            mobile_cwv_ok, mobile_cwv_note = evaluate_cwv("mobile", "PHONE")
+            step_cwv()
+        else:
+            desktop_cwv_ok, desktop_cwv_note = False, "Skipped (Core Web Vitals disabled in Settings)"
+            mobile_cwv_ok, mobile_cwv_note = False, "Skipped (Core Web Vitals disabled in Settings)"
+            step_cwv()
+
+    cwv_thread = threading.Thread(target=run_cwv_flow, daemon=True)
+    cwv_thread.start()
+
+    emit_status("Discovering internal pages...")
+    pages = discover_internal_pages(url, max_pages=max_pages)
+    non_cwv_steps = 1 + (len(pages) * len(DEVICE_PROFILES)) + 13
+    init_non_cwv(non_cwv_steps)
+    step_non_cwv()
+    emit_status(f"Auditing {len(pages)} page(s) across desktop/mobile/tablet...")
+    audits = run_device_audits(pages, on_audit_complete=step_non_cwv)
+
+    desktop = audits["desktop"]
+    mobile = audits["mobile"]
+    tablet = audits["tablet"]
+    is_wp, wp_note = detect_wordpress(url)
+    pages_html: List[str] = []
+    for p in pages:
+        try:
+            pages_html.append(fetch_html(p))
+        except Exception:
+            continue
+    homepage_html = pages_html[0] if pages_html else ""
+    expected_business_name = str((settings or {}).get("expected_business_name", "")).strip()
+    social_ok, social_note = (
+        check_social_links_with_business_hint(url, homepage_html, expected_business_name)
+        if homepage_html
+        else (False, "Unable to fetch page HTML")
+    )
+    social_inventory, social_conflicts = get_social_link_inventory(url, homepage_html) if homepage_html else ([], [])
+    if on_social_links:
+        on_social_links(social_inventory, social_conflicts)
+    noindex_ok, noindex_note = check_noindex_discouraged(url, homepage_html) if homepage_html else (False, "Unable to fetch page HTML")
+    spell_ok, spell_note = check_spelling_grammar(pages_html)
+    img_ok, img_note = check_image_quality(url, pages_html)
+    video_ok, video_note = check_videos_load(url, pages_html)
+    name_ok, name_note = check_business_name(pages_html, expected_business_name)
 
     rows: List[CheckResult] = []
+    emit_status("Waiting for Core Web Vitals check to finish...")
+    cwv_thread.join()
+
     emit_row(
         CheckResult(
             component="If Inheriting an Exiting Website: Is it a passable design?",
@@ -662,7 +963,7 @@ def build_results(
         ),
         rows,
     )
-    step_progress()
+    step_non_cwv()
     emit_row(
         CheckResult(
             component="Fast website/page load speed (Does it feel fast/snappy?)",
@@ -681,7 +982,7 @@ def build_results(
         ),
         rows,
     )
-    step_progress()
+    step_non_cwv()
     emit_row(
         CheckResult(
             component="Navigation bar functionality - responsive menu bar",
@@ -693,7 +994,7 @@ def build_results(
         ),
         rows,
     )
-    step_progress()
+    step_non_cwv()
     emit_row(
         CheckResult(
             component="Working links & buttons",
@@ -705,7 +1006,7 @@ def build_results(
         ),
         rows,
     )
-    step_progress()
+    step_non_cwv()
     emit_row(
         CheckResult(
             component="Phone Number Present in Head (NOT Only Book Online)",
@@ -717,7 +1018,7 @@ def build_results(
         ),
         rows,
     )
-    step_progress()
+    step_non_cwv()
     emit_row(
         CheckResult(
             component="Footer functionality - working links",
@@ -729,7 +1030,82 @@ def build_results(
         ),
         rows,
     )
-    step_progress()
+    step_non_cwv()
+    emit_row(
+        CheckResult(
+            component="Correct spelling & grammar, no typos",
+            yes_no=yn(spell_ok),
+            desktop=pf(spell_ok),
+            mobile=pf(spell_ok),
+            tablet=pf(spell_ok),
+            notes=spell_note,
+        ),
+        rows,
+    )
+    step_non_cwv()
+    emit_row(
+        CheckResult(
+            component="Images are compressed, high resolution, not blurry or pixelated",
+            yes_no=yn(img_ok),
+            desktop=pf(img_ok),
+            mobile=pf(img_ok),
+            tablet=pf(img_ok),
+            notes=f"Heuristic image-quality check. {img_note}",
+        ),
+        rows,
+    )
+    step_non_cwv()
+    emit_row(
+        CheckResult(
+            component="Videos load correctly",
+            yes_no=yn(video_ok),
+            desktop=pf(video_ok),
+            mobile=pf(video_ok),
+            tablet=pf(video_ok),
+            notes=f"Source-reachability check. {video_note}",
+        ),
+        rows,
+    )
+    step_non_cwv()
+    emit_row(
+        CheckResult(
+            component="Social media links out to correct pages",
+            yes_no=yn(social_ok),
+            desktop=pf(social_ok),
+            mobile=pf(social_ok),
+            tablet=pf(social_ok),
+            notes=(
+                "Reachability + name-token hint (not ownership-proof). "
+                f"{social_note}; conflicts={', '.join(social_conflicts) if social_conflicts else 'none'}"
+            ),
+        ),
+        rows,
+    )
+    step_non_cwv()
+    emit_row(
+        CheckResult(
+            component="Search Engine Visibility NOT Checked to Discourage Indexing",
+            yes_no=yn(noindex_ok),
+            desktop=pf(noindex_ok),
+            mobile=pf(noindex_ok),
+            tablet=pf(noindex_ok),
+            notes=noindex_note,
+        ),
+        rows,
+    )
+    step_non_cwv()
+    emit_row(
+        CheckResult(
+            component="Using correct business name",
+            yes_no=yn(name_ok),
+            desktop=pf(name_ok),
+            mobile=pf(name_ok),
+            tablet=pf(name_ok),
+            notes=name_note,
+        ),
+        rows,
+    )
+    step_non_cwv()
     emit_row(
         CheckResult(
             component="Rise Plugin Compatible (Wordpress)",
@@ -741,19 +1117,53 @@ def build_results(
         ),
         rows,
     )
-    step_progress()
+    step_non_cwv()
     emit_row(
         CheckResult(
             component="Core Web Vitals",
-            yes_no=yn(desktop_cwv_ok and mobile_cwv_ok),
-            desktop=pf(desktop_cwv_ok),
-            mobile=pf(mobile_cwv_ok),
-            tablet=pf(mobile_cwv_ok),
+            yes_no=(
+                "TBD"
+                if (
+                    "too many requests" in desktop_cwv_note.lower()
+                    or "too many requests" in mobile_cwv_note.lower()
+                    or "unavailable" in desktop_cwv_note.lower()
+                    or "unavailable" in mobile_cwv_note.lower()
+                    or "skipped (core web vitals disabled" in desktop_cwv_note.lower()
+                    or "skipped (core web vitals disabled" in mobile_cwv_note.lower()
+                )
+                else yn(desktop_cwv_ok and mobile_cwv_ok)
+            ),
+            desktop=(
+                "Manual"
+                if (
+                    "too many requests" in desktop_cwv_note.lower()
+                    or "unavailable" in desktop_cwv_note.lower()
+                    or "skipped (core web vitals disabled" in desktop_cwv_note.lower()
+                )
+                else pf(desktop_cwv_ok)
+            ),
+            mobile=(
+                "Manual"
+                if (
+                    "too many requests" in mobile_cwv_note.lower()
+                    or "unavailable" in mobile_cwv_note.lower()
+                    or "skipped (core web vitals disabled" in mobile_cwv_note.lower()
+                )
+                else pf(mobile_cwv_ok)
+            ),
+            tablet=(
+                "Manual"
+                if (
+                    "too many requests" in mobile_cwv_note.lower()
+                    or "unavailable" in mobile_cwv_note.lower()
+                    or "skipped (core web vitals disabled" in mobile_cwv_note.lower()
+                )
+                else pf(mobile_cwv_ok)
+            ),
             notes=f"Desktop {desktop_cwv_note}; Mobile/Tablet {mobile_cwv_note}; pages_audited={len(pages)}",
         ),
         rows,
     )
-    step_progress()
     emit_status("Finalizing results...")
     return rows
 

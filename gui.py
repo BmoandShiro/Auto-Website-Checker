@@ -7,11 +7,12 @@ import csv
 import json
 import os
 import sys
+import webbrowser
 from dataclasses import asdict
 from typing import List
 
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QFontMetrics
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -24,6 +25,8 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -33,6 +36,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+    QSizePolicy,
 )
 
 from main import CheckResult, build_results
@@ -48,6 +52,7 @@ DEFAULT_SETTINGS = {
     "request_throttle_seconds": 0.5,
     "prefer_crux_first": True,
     "enable_core_web_vitals": False,
+    "expected_business_name": "",
 }
 
 
@@ -121,7 +126,9 @@ class AuditWorker(QThread):
     finished_ok = pyqtSignal(list)
     row_ready = pyqtSignal(object)
     status = pyqtSignal(str)
-    progress = pyqtSignal(int, int)
+    social_links_ready = pyqtSignal(list, list)
+    progress_non_cwv = pyqtSignal(int, int)
+    progress_cwv = pyqtSignal(int, int)
     failed = pyqtSignal(str)
 
     def __init__(self, url: str, settings: dict) -> None:
@@ -138,13 +145,21 @@ class AuditWorker(QThread):
                 self.status.emit(message)
 
             def emit_progress(done: int, total: int) -> None:
-                self.progress.emit(done, total)
+                self.progress_non_cwv.emit(done, total)
+
+            def emit_progress_cwv(done: int, total: int) -> None:
+                self.progress_cwv.emit(done, total)
+
+            def emit_social_links(links: list, conflicts: list) -> None:
+                self.social_links_ready.emit(links, conflicts)
 
             results = build_results(
                 self.url,
                 on_row=emit_row,
                 on_status=emit_status,
-                on_progress=emit_progress,
+                on_social_links=emit_social_links,
+                on_progress_non_cwv=emit_progress,
+                on_progress_cwv=emit_progress_cwv,
                 settings=self.settings,
             )
             self.finished_ok.emit(results)
@@ -185,12 +200,30 @@ class MainWindow(QMainWindow):
         url_row.addWidget(self.settings_btn)
         layout.addLayout(url_row)
 
+        business_row = QHBoxLayout()
+        business_row.addWidget(QLabel("Expected Business Name:"))
+        self.business_name_input = QLineEdit()
+        self.business_name_input.setPlaceholderText("e.g. Renew Dental Loft")
+        self.business_name_input.setText(str(self.settings.get("expected_business_name", "")))
+        business_row.addWidget(self.business_name_input)
+        layout.addLayout(business_row)
+
         self.status_label = QLabel("Enter a URL and click Run Check.")
         layout.addWidget(self.status_label)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        layout.addWidget(self.progress_bar)
+
+        self.progress_non_cwv_label = QLabel("QA Checks Progress")
+        layout.addWidget(self.progress_non_cwv_label)
+        self.progress_non_cwv_bar = QProgressBar()
+        self.progress_non_cwv_bar.setRange(0, 100)
+        self.progress_non_cwv_bar.setValue(0)
+        layout.addWidget(self.progress_non_cwv_bar)
+
+        self.progress_cwv_label = QLabel("Core Web Vitals Progress")
+        layout.addWidget(self.progress_cwv_label)
+        self.progress_cwv_bar = QProgressBar()
+        self.progress_cwv_bar.setRange(0, 100)
+        self.progress_cwv_bar.setValue(0)
+        layout.addWidget(self.progress_cwv_bar)
 
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
@@ -207,7 +240,28 @@ class MainWindow(QMainWindow):
         self.table.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setColumnWidth(0, 430)
+        self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.table.setMinimumHeight(280)
         layout.addWidget(self.table)
+
+        self.social_label = QLabel("Social links (double-click to open)")
+        layout.addWidget(self.social_label)
+        self.social_list = QListWidget()
+        self.social_list.itemDoubleClicked.connect(self.open_social_link)
+        self.social_list.setMinimumHeight(120)
+        layout.addWidget(self.social_list)
+        layout.setStretch(0, 0)  # URL row
+        layout.setStretch(1, 0)  # business row
+        layout.setStretch(2, 0)  # status
+        layout.setStretch(3, 0)  # non-CWV label
+        layout.setStretch(4, 0)  # non-CWV bar
+        layout.setStretch(5, 0)  # CWV label
+        layout.setStretch(6, 0)  # CWV bar
+        layout.setStretch(7, 1)  # table gets remaining height
+        layout.setStretch(8, 0)  # social label
+        layout.setStretch(9, 0)  # social list
+        layout.setStretch(10, 0)  # footer
 
         footer_row = QHBoxLayout()
         self.credit_label = QLabel("Created by: BMOandShiro")
@@ -237,13 +291,20 @@ class MainWindow(QMainWindow):
         self.save_btn.setEnabled(False)
         self.results = []
         self.table.setRowCount(0)
+        self.social_list.clear()
+        self.social_label.setText("Social links (double-click to open)")
         self.status_label.setText("Running checks... this may take a minute.")
-        self.progress_bar.setValue(0)
+        self.progress_non_cwv_bar.setValue(0)
+        self.progress_cwv_bar.setValue(0)
+        self.settings["expected_business_name"] = self.business_name_input.text().strip()
+        self._save_settings()
         self.worker = AuditWorker(url, self.settings)
         self.worker.finished_ok.connect(self.on_success)
         self.worker.row_ready.connect(self._append_row)
         self.worker.status.connect(self.status_label.setText)
-        self.worker.progress.connect(self.on_progress)
+        self.worker.social_links_ready.connect(self.on_social_links_ready)
+        self.worker.progress_non_cwv.connect(self.on_progress_non_cwv)
+        self.worker.progress_cwv.connect(self.on_progress_cwv)
         self.worker.failed.connect(self.on_error)
         self.worker.start()
 
@@ -273,17 +334,37 @@ class MainWindow(QMainWindow):
 
     def on_success(self, results: list) -> None:
         self.results = results
+        self._fit_qa_column()
         self.run_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
-        self.progress_bar.setValue(100)
+        self.progress_non_cwv_bar.setValue(100)
+        self.progress_cwv_bar.setValue(100)
         self.status_label.setText("Complete. Results displayed below.")
 
-    def on_progress(self, done: int, total: int) -> None:
+    def _fit_qa_column(self) -> None:
+        # Auto-size QA Component column to avoid wrapping its text.
+        if not self.results:
+            return
+        fm = QFontMetrics(self.table.font())
+        max_width = fm.horizontalAdvance("QA Component")
+        for result in self.results:
+            max_width = max(max_width, fm.horizontalAdvance(result.component))
+        # Add padding and clamp so the table remains usable.
+        self.table.setColumnWidth(0, max(260, min(max_width + 28, 760)))
+
+    def on_progress_non_cwv(self, done: int, total: int) -> None:
         if total <= 0:
-            self.progress_bar.setValue(0)
+            self.progress_non_cwv_bar.setValue(0)
             return
         pct = int((done / total) * 100)
-        self.progress_bar.setValue(max(0, min(100, pct)))
+        self.progress_non_cwv_bar.setValue(max(0, min(100, pct)))
+
+    def on_progress_cwv(self, done: int, total: int) -> None:
+        if total <= 0:
+            self.progress_cwv_bar.setValue(0)
+            return
+        pct = int((done / total) * 100)
+        self.progress_cwv_bar.setValue(max(0, min(100, pct)))
 
     def _append_row(self, result: CheckResult) -> None:
         row = asdict(result)
@@ -306,9 +387,29 @@ class MainWindow(QMainWindow):
     def on_error(self, message: str) -> None:
         self.run_btn.setEnabled(True)
         self.save_btn.setEnabled(False)
-        self.progress_bar.setValue(0)
+        self.progress_non_cwv_bar.setValue(0)
+        self.progress_cwv_bar.setValue(0)
         self.status_label.setText("Check failed.")
         QMessageBox.critical(self, "Run failed", message)
+
+    def on_social_links_ready(self, links: list, conflicts: list) -> None:
+        self.social_list.clear()
+        for entry in links:
+            platform = entry.get("platform", "social")
+            url = entry.get("url", "")
+            account = entry.get("account_key", "")
+            item = QListWidgetItem(f"[{platform}] {account} -> {url}")
+            item.setData(Qt.ItemDataRole.UserRole, url)
+            self.social_list.addItem(item)
+        if conflicts:
+            self.social_label.setText(f"Social links (conflicts found: {', '.join(conflicts)})")
+        else:
+            self.social_label.setText("Social links (double-click to open)")
+
+    def open_social_link(self, item: QListWidgetItem) -> None:
+        url = item.data(Qt.ItemDataRole.UserRole)
+        if url:
+            webbrowser.open(url)
 
     def save_csv(self) -> None:
         if not self.results:
