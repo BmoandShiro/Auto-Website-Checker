@@ -875,6 +875,34 @@ def run_device_audits(
     urls: List[str], on_audit_complete=None
 ) -> Tuple[Dict[str, MultiPageDeviceAudit], Dict[str, List[DeviceAudit]]]:
     by_profile: Dict[str, List[DeviceAudit]] = {p.name: [] for p in DEVICE_PROFILES}
+
+    def synthesize_browser_unavailable(reason: str) -> Tuple[Dict[str, MultiPageDeviceAudit], Dict[str, List[DeviceAudit]]]:
+        for profile in DEVICE_PROFILES:
+            for url in urls:
+                by_profile[profile.name].append(
+                    DeviceAudit(
+                        name=profile.name,
+                        page_url=url,
+                        load_ms=TIMEOUT_SECONDS * 1000,
+                        nav_ok=False,
+                        links_ok=False,
+                        links_note=f"Manual (browser unavailable: {reason})",
+                        links_failed=[f"{url} (browser unavailable)"],
+                        links_ok_urls=[],
+                        phone_ok=False,
+                        phone_note=f"Manual (browser unavailable: {reason})",
+                        footer_ok=False,
+                        footer_note=f"Manual (browser unavailable: {reason})",
+                        footer_failed=[f"{url} (browser unavailable)"],
+                    )
+                )
+                if on_audit_complete:
+                    on_audit_complete()
+        merged_local: Dict[str, MultiPageDeviceAudit] = {}
+        for profile in DEVICE_PROFILES:
+            merged_local[profile.name] = combine_device_audits(profile.name, by_profile[profile.name])
+        return merged_local, by_profile
+
     with sync_playwright() as p:
         try:
             browser: Browser = p.chromium.launch(headless=True)
@@ -884,7 +912,7 @@ def run_device_audits(
                 subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, timeout=300)
                 browser = p.chromium.launch(headless=True)
             except Exception:
-                raise first_exc
+                return synthesize_browser_unavailable(str(first_exc))
         try:
             for profile in DEVICE_PROFILES:
                 context = browser.new_context(
@@ -1050,6 +1078,7 @@ def build_results(
     desktop = audits["desktop"]
     mobile = audits["mobile"]
     tablet = audits["tablet"]
+    browser_unavailable = "browser unavailable" in desktop.links_note.lower()
     is_wp, wp_note = detect_wordpress(url)
     pages_html: List[str] = []
     for p in pages:
@@ -1105,14 +1134,14 @@ def build_results(
         emit_row(
         CheckResult(
             component="Fast website/page load speed (Does it feel fast/snappy?)",
-            yes_no=yn(
+            yes_no=("TBD" if browser_unavailable else yn(
                 desktop.avg_load_ms <= FAST_LOAD_MS_THRESHOLD
                 and mobile.avg_load_ms <= FAST_LOAD_MS_THRESHOLD
                 and tablet.avg_load_ms <= FAST_LOAD_MS_THRESHOLD
-            ),
-            desktop=pf(desktop.avg_load_ms <= FAST_LOAD_MS_THRESHOLD),
-            mobile=pf(mobile.avg_load_ms <= FAST_LOAD_MS_THRESHOLD),
-            tablet=pf(tablet.avg_load_ms <= FAST_LOAD_MS_THRESHOLD),
+            )),
+            desktop=("Manual" if browser_unavailable else pf(desktop.avg_load_ms <= FAST_LOAD_MS_THRESHOLD)),
+            mobile=("Manual" if browser_unavailable else pf(mobile.avg_load_ms <= FAST_LOAD_MS_THRESHOLD)),
+            tablet=("Manual" if browser_unavailable else pf(tablet.avg_load_ms <= FAST_LOAD_MS_THRESHOLD)),
             notes=(
                 f"Avg load ms across {len(pages)} page(s): "
                 f"desktop={desktop.avg_load_ms}, mobile={mobile.avg_load_ms}, tablet={tablet.avg_load_ms}"
@@ -1125,10 +1154,10 @@ def build_results(
         emit_row(
         CheckResult(
             component="Navigation bar functionality - responsive menu bar",
-            yes_no=yn(desktop.nav_ok and mobile.nav_ok and tablet.nav_ok),
-            desktop=pf(desktop.nav_ok),
-            mobile=pf(mobile.nav_ok),
-            tablet=pf(tablet.nav_ok),
+            yes_no=("TBD" if browser_unavailable else yn(desktop.nav_ok and mobile.nav_ok and tablet.nav_ok)),
+            desktop=("Manual" if browser_unavailable else pf(desktop.nav_ok)),
+            mobile=("Manual" if browser_unavailable else pf(mobile.nav_ok)),
+            tablet=("Manual" if browser_unavailable else pf(tablet.nav_ok)),
             notes=f"D:{desktop.nav_note} | M:{mobile.nav_note} | T:{tablet.nav_note}",
         ),
         rows,
@@ -1138,10 +1167,10 @@ def build_results(
         emit_row(
         CheckResult(
             component="Working links & buttons",
-            yes_no=yn(desktop.links_ok and mobile.links_ok and tablet.links_ok),
-            desktop=pf(desktop.links_ok),
-            mobile=pf(mobile.links_ok),
-            tablet=pf(tablet.links_ok),
+            yes_no=("TBD" if browser_unavailable else yn(desktop.links_ok and mobile.links_ok and tablet.links_ok)),
+            desktop=("Manual" if browser_unavailable else pf(desktop.links_ok)),
+            mobile=("Manual" if browser_unavailable else pf(mobile.links_ok)),
+            tablet=("Manual" if browser_unavailable else pf(tablet.links_ok)),
             notes=f"D:{desktop.links_note} | M:{mobile.links_note} | T:{tablet.links_note}",
         ),
         rows,
@@ -1151,10 +1180,10 @@ def build_results(
         emit_row(
         CheckResult(
             component="Phone Number Present in Head (NOT Only Book Online)",
-            yes_no=yn(desktop.phone_ok and mobile.phone_ok and tablet.phone_ok),
-            desktop=pf(desktop.phone_ok),
-            mobile=pf(mobile.phone_ok),
-            tablet=pf(tablet.phone_ok),
+            yes_no=("TBD" if browser_unavailable else yn(desktop.phone_ok and mobile.phone_ok and tablet.phone_ok)),
+            desktop=("Manual" if browser_unavailable else pf(desktop.phone_ok)),
+            mobile=("Manual" if browser_unavailable else pf(mobile.phone_ok)),
+            tablet=("Manual" if browser_unavailable else pf(tablet.phone_ok)),
             notes=f"D:{desktop.phone_note} | M:{mobile.phone_note} | T:{tablet.phone_note}",
         ),
         rows,
@@ -1164,10 +1193,10 @@ def build_results(
         emit_row(
         CheckResult(
             component="Footer functionality - working links",
-            yes_no=yn(desktop.footer_ok and mobile.footer_ok and tablet.footer_ok),
-            desktop=pf(desktop.footer_ok),
-            mobile=pf(mobile.footer_ok),
-            tablet=pf(tablet.footer_ok),
+            yes_no=("TBD" if browser_unavailable else yn(desktop.footer_ok and mobile.footer_ok and tablet.footer_ok)),
+            desktop=("Manual" if browser_unavailable else pf(desktop.footer_ok)),
+            mobile=("Manual" if browser_unavailable else pf(mobile.footer_ok)),
+            tablet=("Manual" if browser_unavailable else pf(tablet.footer_ok)),
             notes=f"D:{desktop.footer_note} | M:{mobile.footer_note} | T:{tablet.footer_note}",
         ),
         rows,

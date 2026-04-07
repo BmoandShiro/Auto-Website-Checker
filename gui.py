@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import subprocess
 import sys
 import webbrowser
 from dataclasses import asdict
@@ -575,10 +576,22 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(True)
         self.progress_non_cwv_bar.setValue(100)
         self.progress_cwv_bar.setValue(100)
+        browser_missing = any("browser unavailable" in (r.notes or "").lower() for r in results)
         if bool(self.settings.get("auto_save_last_run", True)):
             self._save_current_run_to_history()
             self.refresh_history_dropdown()
-        self.status_label.setText("Complete. Results displayed below.")
+        if browser_missing:
+            self.status_label.setText("Complete with manual fallback: browser dependency missing. Click 'Install Browser Dependency'.")
+            choice = QMessageBox.question(
+                self,
+                "Browser Dependency Missing",
+                "Chromium is missing, so browser-based checks were set to Manual.\n\nInstall Chromium now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if choice == QMessageBox.StandardButton.Yes:
+                self.install_browser_dependency()
+        else:
+            self.status_label.setText("Complete. Results displayed below.")
 
     def _fit_qa_column(self) -> None:
         # Auto-size QA Component column to avoid wrapping its text.
@@ -630,6 +643,26 @@ class MainWindow(QMainWindow):
         self.progress_cwv_bar.setValue(0)
         self.status_label.setText("Check failed.")
         QMessageBox.critical(self, "Run failed", message)
+
+    def install_browser_dependency(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Install Browser Dependency",
+            "Install Chromium now for browser-based checks? This can take a few minutes.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.install_browser_btn.setEnabled(False)
+        self.status_label.setText("Installing Chromium dependency...")
+        try:
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, timeout=600)
+            self.status_label.setText("Chromium installed. Re-run checks to enable browser-based rows.")
+            QMessageBox.information(self, "Install complete", "Chromium installed successfully.")
+        except Exception as exc:
+            self.status_label.setText("Browser install failed.")
+            QMessageBox.critical(self, "Install failed", str(exc))
+        finally:
+            pass
 
     def on_social_links_ready(self, links: list, conflicts: list) -> None:
         self.latest_social_links = links
