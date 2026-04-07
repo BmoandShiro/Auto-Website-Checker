@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import random
 import re
 import sys
 import time
@@ -15,16 +17,20 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
-from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
+from playwright.sync_api import Browser, BrowserContext, Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 
 USER_AGENT = "Mozilla/5.0 (compatible; AutoWebsiteChecker/1.0)"
-TIMEOUT_SECONDS = 15
+TIMEOUT_SECONDS = 30
 MAX_LINKS_PER_CHECK = 30
 FAST_LOAD_MS_THRESHOLD = 2500
 MAX_PAGES_TO_AUDIT = 5
 PSI_COOLDOWN_SECONDS = 3
+REQUEST_THROTTLE_SECONDS = 0.5
+PREFER_CRUX_FIRST = True
+ENABLE_CORE_WEB_VITALS = False
 PHONE_PATTERN = re.compile(r"\+?\d[\d\-\(\)\s]{7,}\d")
+LAST_REQUEST_TS = 0.0
 
 
 @dataclass
@@ -84,6 +90,31 @@ DEVICE_PROFILES = [
 ]
 
 
+def apply_runtime_settings(settings: Dict[str, object] | None) -> None:
+    global TIMEOUT_SECONDS, MAX_LINKS_PER_CHECK, FAST_LOAD_MS_THRESHOLD
+    global MAX_PAGES_TO_AUDIT, PSI_COOLDOWN_SECONDS, REQUEST_THROTTLE_SECONDS
+    global PREFER_CRUX_FIRST, ENABLE_CORE_WEB_VITALS
+    if not settings:
+        return
+    TIMEOUT_SECONDS = int(settings.get("timeout_seconds", TIMEOUT_SECONDS))
+    MAX_LINKS_PER_CHECK = int(settings.get("max_links_per_check", MAX_LINKS_PER_CHECK))
+    FAST_LOAD_MS_THRESHOLD = int(settings.get("fast_load_ms_threshold", FAST_LOAD_MS_THRESHOLD))
+    MAX_PAGES_TO_AUDIT = int(settings.get("max_pages_to_audit", MAX_PAGES_TO_AUDIT))
+    PSI_COOLDOWN_SECONDS = float(settings.get("psi_cooldown_seconds", PSI_COOLDOWN_SECONDS))
+    REQUEST_THROTTLE_SECONDS = float(settings.get("request_throttle_seconds", REQUEST_THROTTLE_SECONDS))
+    PREFER_CRUX_FIRST = bool(settings.get("prefer_crux_first", PREFER_CRUX_FIRST))
+    ENABLE_CORE_WEB_VITALS = bool(settings.get("enable_core_web_vitals", ENABLE_CORE_WEB_VITALS))
+
+
+def throttle_requests() -> None:
+    global LAST_REQUEST_TS
+    now = time.time()
+    elapsed = now - LAST_REQUEST_TS
+    if elapsed < REQUEST_THROTTLE_SECONDS:
+        time.sleep(REQUEST_THROTTLE_SECONDS - elapsed)
+    LAST_REQUEST_TS = time.time()
+
+
 def fetch_status(url: str) -> int:
     req = Request(url, headers={"User-Agent": USER_AGENT}, method="HEAD")
     try:
@@ -125,7 +156,9 @@ def normalize_links(base_url: str, links: List[str]) -> List[str]:
     return deduped
 
 
-def check_link_set(urls: List[str], max_to_check: int = MAX_LINKS_PER_CHECK) -> Tuple[bool, str, List[str]]:
+def check_link_set(urls: List[str], max_to_check: int | None = None) -> Tuple[bool, str, List[str]]:
+    if max_to_check is None:
+        max_to_check = MAX_LINKS_PER_CHECK
     if not urls:
         return False, "No links found", []
     tested = 0
@@ -142,37 +175,77 @@ def check_link_set(urls: List[str], max_to_check: int = MAX_LINKS_PER_CHECK) -> 
     return True, f"Checked {tested} links, all OK", []
 
 
-def fetch_pagespeed_result(url: str, strategy: str) -> Dict[str, object]:
+def fetch_pagespeed_result(url: str, strategy: str, api_key: str = "") -> Dict[str, object]:
     endpoint = (
         "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
         f"?url={url}&strategy={strategy}&category=PERFORMANCE"
     )
+    if api_key:
+        endpoint += f"&key={api_key}"
+    throttle_requests()
     req = Request(endpoint, headers={"User-Agent": USER_AGENT})
     with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
         payload = json.loads(resp.read().decode("utf-8", errors="replace"))
     return payload
 
 
-def fetch_pagespeed_with_retry(url: str, strategy: str, retries: int = 3, base_delay_s: float = 1.5) -> Dict[str, object]:
+def fetch_pagespeed_with_retry(
+    url: str, strategy: str, retries: int = 3, base_delay_s: float = 1.5, api_key: str = ""
+) -> Dict[str, object]:
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:
-            return fetch_pagespeed_result(url, strategy)
+            return fetch_pagespeed_result(url, strategy, api_key=api_key)
         except HTTPError as exc:
             last_exc = exc
             if exc.code == 429 and attempt < retries:
-                time.sleep(base_delay_s * (2**attempt))
+                jitter = random.uniform(0.0, 0.75)
+                time.sleep((base_delay_s * (2**attempt)) + jitter)
                 continue
             raise
         except (URLError, ValueError, KeyError) as exc:
             last_exc = exc
             if attempt < retries:
-                time.sleep(base_delay_s * (2**attempt))
+                jitter = random.uniform(0.0, 0.75)
+                time.sleep((base_delay_s * (2**attempt)) + jitter)
                 continue
             raise
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("Unknown PageSpeed retry failure")
+
+
+def fetch_crux_result(url: str, form_factor: str, api_key: str) -> Dict[str, object]:
+    endpoint = f"https://chromeuxreport.googleapis.com/v1/records:queryRecord?key={api_key}"
+    payload = json.dumps({"url": url, "formFactor": form_factor}).encode("utf-8")
+    throttle_requests()
+    req = Request(
+        endpoint,
+        data=payload,
+        headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def extract_crux_pass(payload: Dict[str, object]) -> Tuple[bool, str]:
+    record = payload.get("record", {})
+    metrics = record.get("metrics", {}) if isinstance(record, dict) else {}
+    if not isinstance(metrics, dict):
+        return False, "CrUX record has no metrics"
+
+    lcp = metrics.get("largest_contentful_paint", {}).get("percentiles", {}).get("p75")
+    inp = metrics.get("interaction_to_next_paint", {}).get("percentiles", {}).get("p75")
+    cls = metrics.get("cumulative_layout_shift", {}).get("percentiles", {}).get("p75")
+
+    if lcp is None or inp is None or cls is None:
+        return False, "CrUX missing LCP/INP/CLS p75"
+
+    cls_value = float(cls) / 1000.0
+    passed = int(lcp) <= 2500 and int(inp) <= 200 and cls_value <= 0.1
+    note = f"crux_p75 lcp={int(lcp)}ms inp={int(inp)}ms cls={cls_value:.3f}"
+    return passed, note
 
 
 def extract_core_web_vitals_pass(payload: Dict[str, object]) -> Tuple[bool, str]:
@@ -211,7 +284,9 @@ def get_hostname(url: str) -> str:
     return urlparse(url).netloc.lower()
 
 
-def discover_internal_pages(seed_url: str, max_pages: int = MAX_PAGES_TO_AUDIT) -> List[str]:
+def discover_internal_pages(seed_url: str, max_pages: int | None = None) -> List[str]:
+    if max_pages is None:
+        max_pages = MAX_PAGES_TO_AUDIT
     pages = [seed_url]
     seed_host = get_hostname(seed_url)
     try:
@@ -307,8 +382,25 @@ def detect_phone_in_header(page: Page) -> Tuple[bool, str]:
 
 def audit_device(context: BrowserContext, url: str, profile_name: str) -> DeviceAudit:
     page: Page = context.new_page()
-    page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT_SECONDS * 1000)
-    page.wait_for_load_state("load", timeout=TIMEOUT_SECONDS * 1000)
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT_SECONDS * 1000)
+        page.wait_for_load_state("load", timeout=TIMEOUT_SECONDS * 1000)
+    except (PlaywrightTimeoutError, PlaywrightError):
+        page.close()
+        return DeviceAudit(
+            name=profile_name,
+            page_url=url,
+            load_ms=TIMEOUT_SECONDS * 1000,
+            nav_ok=False,
+            links_ok=False,
+            links_note=f"Page timeout/error after {TIMEOUT_SECONDS}s",
+            links_failed=[f"{url} (timeout/error)"],
+            phone_ok=False,
+            phone_note=f"Page timeout/error after {TIMEOUT_SECONDS}s",
+            footer_ok=False,
+            footer_note=f"Page timeout/error after {TIMEOUT_SECONDS}s",
+            footer_failed=[f"{url} (timeout/error)"],
+        )
 
     load_ms = page.evaluate(
         """
@@ -427,7 +519,7 @@ def combine_device_audits(profile_name: str, audits: List[DeviceAudit]) -> Multi
     )
 
 
-def run_device_audits(urls: List[str]) -> Dict[str, MultiPageDeviceAudit]:
+def run_device_audits(urls: List[str], on_audit_complete=None) -> Dict[str, MultiPageDeviceAudit]:
     audits: Dict[str, DeviceAudit] = {}
     by_profile: Dict[str, List[DeviceAudit]] = {p.name: [] for p in DEVICE_PROFILES}
     with sync_playwright() as p:
@@ -443,6 +535,8 @@ def run_device_audits(urls: List[str]) -> Dict[str, MultiPageDeviceAudit]:
                 try:
                     for url in urls:
                         by_profile[profile.name].append(audit_device(context, url, profile.name))
+                        if on_audit_complete:
+                            on_audit_complete()
                 finally:
                     context.close()
         finally:
@@ -453,9 +547,51 @@ def run_device_audits(urls: List[str]) -> Dict[str, MultiPageDeviceAudit]:
     return merged
 
 
-def build_results(url: str, max_pages: int = MAX_PAGES_TO_AUDIT) -> List[CheckResult]:
+def build_results(
+    url: str,
+    max_pages: int = MAX_PAGES_TO_AUDIT,
+    on_row=None,
+    on_status=None,
+    on_progress=None,
+    settings: Dict[str, object] | None = None,
+) -> List[CheckResult]:
+    apply_runtime_settings(settings)
+    if settings and "max_pages_to_audit" in settings:
+        max_pages = int(settings["max_pages_to_audit"])
+
+    def emit_status(message: str) -> None:
+        if on_status:
+            on_status(message)
+
+    def emit_row(row: CheckResult, out: List[CheckResult]) -> None:
+        out.append(row)
+        if on_row:
+            on_row(row)
+
+    progress_total = 1
+    progress_done = 0
+
+    def init_progress(total: int) -> None:
+        nonlocal progress_total, progress_done
+        progress_total = max(1, total)
+        progress_done = 0
+        if on_progress:
+            on_progress(0, progress_total)
+
+    def step_progress() -> None:
+        nonlocal progress_done
+        progress_done += 1
+        if on_progress:
+            on_progress(min(progress_done, progress_total), progress_total)
+
+    emit_status("Discovering internal pages...")
     pages = discover_internal_pages(url, max_pages=max_pages)
-    audits = run_device_audits(pages)
+    cwv_steps = 2 if ENABLE_CORE_WEB_VITALS else 0
+    total_steps = 1 + (len(pages) * len(DEVICE_PROFILES)) + cwv_steps + 8
+    init_progress(total_steps)
+    step_progress()
+    emit_status(f"Auditing {len(pages)} page(s) across desktop/mobile/tablet...")
+    audits = run_device_audits(pages, on_audit_complete=step_progress)
 
     desktop = audits["desktop"]
     mobile = audits["mobile"]
@@ -464,24 +600,58 @@ def build_results(url: str, max_pages: int = MAX_PAGES_TO_AUDIT) -> List[CheckRe
 
     desktop_cwv_ok, desktop_cwv_note = False, "Unavailable"
     mobile_cwv_ok, mobile_cwv_note = False, "Unavailable"
-    try:
-        desktop_payload = fetch_pagespeed_with_retry(url, "desktop")
-        desktop_ok, desktop_note = extract_core_web_vitals_pass(desktop_payload)
-        desktop_cwv_ok, desktop_cwv_note = desktop_ok, desktop_note
-    except (HTTPError, URLError, ValueError, KeyError) as exc:
-        desktop_cwv_note = f"PSI error: {exc}"
+    psi_key = os.getenv("PSI_API_KEY", "").strip()
+    crux_key = os.getenv("CRUX_API_KEY", "").strip() or psi_key
 
-    # Cool down between PSI calls to reduce API throttling.
-    time.sleep(PSI_COOLDOWN_SECONDS)
+    def evaluate_cwv(strategy: str, form_factor: str) -> Tuple[bool, str]:
+        psi_error = ""
+        crux_error = ""
+        if PREFER_CRUX_FIRST and crux_key:
+            try:
+                crux_payload = fetch_crux_result(url, form_factor, crux_key)
+                ok, note = extract_crux_pass(crux_payload)
+                return ok, f"CrUX {note}"
+            except (HTTPError, URLError, ValueError, KeyError) as exc:
+                crux_error = f"CrUX error: {exc}"
 
-    try:
-        mobile_payload = fetch_pagespeed_with_retry(url, "mobile")
-        mobile_ok, mobile_note = extract_core_web_vitals_pass(mobile_payload)
-        mobile_cwv_ok, mobile_cwv_note = mobile_ok, mobile_note
-    except (HTTPError, URLError, ValueError, KeyError) as exc:
-        mobile_cwv_note = f"PSI error: {exc}"
+        try:
+            psi_payload = fetch_pagespeed_with_retry(url, strategy, api_key=psi_key)
+            ok, note = extract_core_web_vitals_pass(psi_payload)
+            if crux_error:
+                return ok, f"PSI {note}; fallback_from_{crux_error}"
+            return ok, f"PSI {note}"
+        except (HTTPError, URLError, ValueError, KeyError) as exc:
+            psi_error = f"PSI error: {exc}"
 
-    return [
+        if (not PREFER_CRUX_FIRST) and crux_key:
+            try:
+                crux_payload = fetch_crux_result(url, form_factor, crux_key)
+                ok, note = extract_crux_pass(crux_payload)
+                return ok, f"{psi_error}; fallback=CrUX {note}"
+            except (HTTPError, URLError, ValueError, KeyError) as exc:
+                return False, f"{psi_error}; CrUX error: {exc}"
+
+        if crux_error:
+            return False, f"{crux_error}; {psi_error}"
+        return False, psi_error or "CWV unavailable"
+
+    if ENABLE_CORE_WEB_VITALS:
+        emit_status("Checking Core Web Vitals (desktop)...")
+        desktop_cwv_ok, desktop_cwv_note = evaluate_cwv("desktop", "DESKTOP")
+        step_progress()
+
+        # Cool down between PSI calls to reduce API throttling.
+        time.sleep(PSI_COOLDOWN_SECONDS)
+
+        emit_status("Checking Core Web Vitals (mobile/tablet)...")
+        mobile_cwv_ok, mobile_cwv_note = evaluate_cwv("mobile", "PHONE")
+        step_progress()
+    else:
+        desktop_cwv_ok, desktop_cwv_note = False, "Skipped (Core Web Vitals disabled in Settings)"
+        mobile_cwv_ok, mobile_cwv_note = False, "Skipped (Core Web Vitals disabled in Settings)"
+
+    rows: List[CheckResult] = []
+    emit_row(
         CheckResult(
             component="If Inheriting an Exiting Website: Is it a passable design?",
             yes_no="TBD",
@@ -490,6 +660,10 @@ def build_results(url: str, max_pages: int = MAX_PAGES_TO_AUDIT) -> List[CheckRe
             tablet="Manual",
             notes="Manual visual/brand quality review required per device.",
         ),
+        rows,
+    )
+    step_progress()
+    emit_row(
         CheckResult(
             component="Fast website/page load speed (Does it feel fast/snappy?)",
             yes_no=yn(
@@ -505,6 +679,10 @@ def build_results(url: str, max_pages: int = MAX_PAGES_TO_AUDIT) -> List[CheckRe
                 f"desktop={desktop.avg_load_ms}, mobile={mobile.avg_load_ms}, tablet={tablet.avg_load_ms}"
             ),
         ),
+        rows,
+    )
+    step_progress()
+    emit_row(
         CheckResult(
             component="Navigation bar functionality - responsive menu bar",
             yes_no=yn(desktop.nav_ok and mobile.nav_ok and tablet.nav_ok),
@@ -513,6 +691,10 @@ def build_results(url: str, max_pages: int = MAX_PAGES_TO_AUDIT) -> List[CheckRe
             tablet=pf(tablet.nav_ok),
             notes=f"D:{desktop.nav_note} | M:{mobile.nav_note} | T:{tablet.nav_note}",
         ),
+        rows,
+    )
+    step_progress()
+    emit_row(
         CheckResult(
             component="Working links & buttons",
             yes_no=yn(desktop.links_ok and mobile.links_ok and tablet.links_ok),
@@ -521,6 +703,10 @@ def build_results(url: str, max_pages: int = MAX_PAGES_TO_AUDIT) -> List[CheckRe
             tablet=pf(tablet.links_ok),
             notes=f"D:{desktop.links_note} | M:{mobile.links_note} | T:{tablet.links_note}",
         ),
+        rows,
+    )
+    step_progress()
+    emit_row(
         CheckResult(
             component="Phone Number Present in Head (NOT Only Book Online)",
             yes_no=yn(desktop.phone_ok and mobile.phone_ok and tablet.phone_ok),
@@ -529,6 +715,10 @@ def build_results(url: str, max_pages: int = MAX_PAGES_TO_AUDIT) -> List[CheckRe
             tablet=pf(tablet.phone_ok),
             notes=f"D:{desktop.phone_note} | M:{mobile.phone_note} | T:{tablet.phone_note}",
         ),
+        rows,
+    )
+    step_progress()
+    emit_row(
         CheckResult(
             component="Footer functionality - working links",
             yes_no=yn(desktop.footer_ok and mobile.footer_ok and tablet.footer_ok),
@@ -537,6 +727,10 @@ def build_results(url: str, max_pages: int = MAX_PAGES_TO_AUDIT) -> List[CheckRe
             tablet=pf(tablet.footer_ok),
             notes=f"D:{desktop.footer_note} | M:{mobile.footer_note} | T:{tablet.footer_note}",
         ),
+        rows,
+    )
+    step_progress()
+    emit_row(
         CheckResult(
             component="Rise Plugin Compatible (Wordpress)",
             yes_no=yn(is_wp),
@@ -545,6 +739,10 @@ def build_results(url: str, max_pages: int = MAX_PAGES_TO_AUDIT) -> List[CheckRe
             tablet=pf(is_wp),
             notes=wp_note,
         ),
+        rows,
+    )
+    step_progress()
+    emit_row(
         CheckResult(
             component="Core Web Vitals",
             yes_no=yn(desktop_cwv_ok and mobile_cwv_ok),
@@ -553,7 +751,11 @@ def build_results(url: str, max_pages: int = MAX_PAGES_TO_AUDIT) -> List[CheckRe
             tablet=pf(mobile_cwv_ok),
             notes=f"Desktop {desktop_cwv_note}; Mobile/Tablet {mobile_cwv_note}; pages_audited={len(pages)}",
         ),
-    ]
+        rows,
+    )
+    step_progress()
+    emit_status("Finalizing results...")
+    return rows
 
 
 def write_csv(results: List[CheckResult], path: str) -> None:

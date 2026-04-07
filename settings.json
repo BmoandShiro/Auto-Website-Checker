@@ -1,0 +1,10 @@
+{
+  "timeout_seconds": 30,
+  "max_links_per_check": 30,
+  "fast_load_ms_threshold": 2500,
+  "max_pages_to_audit": 5,
+  "psi_cooldown_seconds": 3.0,
+  "request_throttle_seconds": 0.5,
+  "prefer_crux_first": true,
+  "enable_core_web_vitals": false
+}
