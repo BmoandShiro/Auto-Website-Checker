@@ -8,6 +8,7 @@ import csv
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 from urllib.error import HTTPError, URLError
@@ -22,6 +23,7 @@ TIMEOUT_SECONDS = 15
 MAX_LINKS_PER_CHECK = 30
 FAST_LOAD_MS_THRESHOLD = 2500
 MAX_PAGES_TO_AUDIT = 5
+PSI_COOLDOWN_SECONDS = 3
 PHONE_PATTERN = re.compile(r"\+?\d[\d\-\(\)\s]{7,}\d")
 
 
@@ -38,13 +40,17 @@ class CheckResult:
 @dataclass
 class DeviceAudit:
     name: str
+    page_url: str
     load_ms: int
     nav_ok: bool
     links_ok: bool
     links_note: str
+    links_failed: List[str]
     phone_ok: bool
+    phone_note: str
     footer_ok: bool
     footer_note: str
+    footer_failed: List[str]
 
 
 @dataclass
@@ -53,9 +59,11 @@ class MultiPageDeviceAudit:
     pages_checked: int
     avg_load_ms: int
     nav_ok: bool
+    nav_note: str
     links_ok: bool
     links_note: str
     phone_ok: bool
+    phone_note: str
     footer_ok: bool
     footer_note: str
 
@@ -117,9 +125,9 @@ def normalize_links(base_url: str, links: List[str]) -> List[str]:
     return deduped
 
 
-def check_link_set(urls: List[str], max_to_check: int = MAX_LINKS_PER_CHECK) -> Tuple[bool, str]:
+def check_link_set(urls: List[str], max_to_check: int = MAX_LINKS_PER_CHECK) -> Tuple[bool, str, List[str]]:
     if not urls:
-        return False, "No links found"
+        return False, "No links found", []
     tested = 0
     failed: List[Tuple[str, int]] = []
     for link in urls[:max_to_check]:
@@ -128,9 +136,10 @@ def check_link_set(urls: List[str], max_to_check: int = MAX_LINKS_PER_CHECK) -> 
         if status == 0 or status >= 400:
             failed.append((link, status))
     if failed:
-        preview = ", ".join(f"{u} ({s})" for u, s in failed[:3])
-        return False, f"{len(failed)}/{tested} failed: {preview}"
-    return True, f"Checked {tested} links, all OK"
+        preview = ", ".join(f"{u} ({s})" for u, s in failed[:5])
+        failure_urls = [f"{u} ({s})" for u, s in failed]
+        return False, f"{len(failed)}/{tested} failed: {preview}", failure_urls
+    return True, f"Checked {tested} links, all OK", []
 
 
 def fetch_pagespeed_result(url: str, strategy: str) -> Dict[str, object]:
@@ -142,6 +151,28 @@ def fetch_pagespeed_result(url: str, strategy: str) -> Dict[str, object]:
     with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
         payload = json.loads(resp.read().decode("utf-8", errors="replace"))
     return payload
+
+
+def fetch_pagespeed_with_retry(url: str, strategy: str, retries: int = 3, base_delay_s: float = 1.5) -> Dict[str, object]:
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return fetch_pagespeed_result(url, strategy)
+        except HTTPError as exc:
+            last_exc = exc
+            if exc.code == 429 and attempt < retries:
+                time.sleep(base_delay_s * (2**attempt))
+                continue
+            raise
+        except (URLError, ValueError, KeyError) as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(base_delay_s * (2**attempt))
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Unknown PageSpeed retry failure")
 
 
 def extract_core_web_vitals_pass(payload: Dict[str, object]) -> Tuple[bool, str]:
@@ -220,6 +251,60 @@ def detect_wordpress(url: str) -> Tuple[bool, str]:
         return False, "Unable to confirm WordPress markers"
 
 
+def detect_phone_in_header(page: Page) -> Tuple[bool, str]:
+    has_phone, note = page.evaluate(
+        """
+        () => {
+          const selectors = [
+            "header",
+            "[role='banner']",
+            ".header",
+            "#header",
+            ".site-header",
+            ".top-bar",
+            "nav"
+          ];
+          const containers = [];
+          for (const s of selectors) {
+            for (const el of document.querySelectorAll(s)) containers.push(el);
+          }
+          const unique = [...new Set(containers)];
+          const phonePattern = /\\+?\\d[\\d\\-\\(\\)\\s]{7,}\\d/;
+
+          // Prefer top-of-page containers, not footer.
+          const inHeader = unique.filter((el) => {
+            if (el.closest("footer")) return false;
+            const rect = el.getBoundingClientRect();
+            return rect.top < (window.innerHeight * 0.5);
+          });
+
+          for (const el of inHeader) {
+            const text = (el.innerText || "").trim();
+            if (phonePattern.test(text)) {
+              return [true, `header text match in ${el.tagName.toLowerCase()}`];
+            }
+            const tel = el.querySelector("a[href^='tel:']");
+            if (tel) {
+              return [true, `tel link found in ${el.tagName.toLowerCase()}`];
+            }
+          }
+
+          // Fallback: a visible tel link above fold not in footer.
+          const telLinks = [...document.querySelectorAll("a[href^='tel:']")].filter((el) => {
+            if (el.closest("footer")) return false;
+            const rect = el.getBoundingClientRect();
+            return rect.top < (window.innerHeight * 0.6);
+          });
+          if (telLinks.length > 0) {
+            return [true, "tel link found near top of page"];
+          }
+          return [false, "No phone detected in header/top-nav area"];
+        }
+        """
+    )
+    return bool(has_phone), str(note)
+
+
 def audit_device(context: BrowserContext, url: str, profile_name: str) -> DeviceAudit:
     page: Page = context.new_page()
     page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT_SECONDS * 1000)
@@ -251,22 +336,25 @@ def audit_device(context: BrowserContext, url: str, profile_name: str) -> Device
         url, page.eval_on_selector_all("footer a[href]", "els => els.map(e => e.getAttribute('href') || '')")
     )
 
-    links_ok, links_note = check_link_set(all_links)
-    footer_ok, footer_note = check_link_set(footer_links)
+    links_ok, links_note, links_failed = check_link_set(all_links)
+    footer_ok, footer_note, footer_failed = check_link_set(footer_links)
 
-    header_text = page.locator("header").first.inner_text() if page.locator("header").count() > 0 else ""
-    phone_ok = bool(PHONE_PATTERN.search(header_text))
+    phone_ok, phone_note = detect_phone_in_header(page)
 
     page.close()
     return DeviceAudit(
         name=profile_name,
+        page_url=url,
         load_ms=int(load_ms),
         nav_ok=nav_ok,
         links_ok=links_ok,
         links_note=links_note,
+        links_failed=links_failed,
         phone_ok=phone_ok,
+        phone_note=phone_note,
         footer_ok=footer_ok,
         footer_note=footer_note,
+        footer_failed=footer_failed,
     )
 
 
@@ -277,9 +365,11 @@ def combine_device_audits(profile_name: str, audits: List[DeviceAudit]) -> Multi
             pages_checked=0,
             avg_load_ms=0,
             nav_ok=False,
+            nav_note="No pages audited",
             links_ok=False,
             links_note="No pages audited",
             phone_ok=False,
+            phone_note="No pages audited",
             footer_ok=False,
             footer_note="No pages audited",
         )
@@ -293,17 +383,47 @@ def combine_device_audits(profile_name: str, audits: List[DeviceAudit]) -> Multi
 
     failed_links = sum(0 if a.links_ok else 1 for a in audits)
     failed_footer = sum(0 if a.footer_ok else 1 for a in audits)
+    failed_nav_pages = [a.page_url for a in audits if not a.nav_ok]
+    failed_phone_pages = [f"{a.page_url} ({a.phone_note})" for a in audits if not a.phone_ok]
+
+    failed_link_entries: List[str] = []
+    for a in audits:
+        for entry in a.links_failed[:5]:
+            failed_link_entries.append(f"{a.page_url} -> {entry}")
+
+    failed_footer_entries: List[str] = []
+    for a in audits:
+        for entry in a.footer_failed[:5]:
+            failed_footer_entries.append(f"{a.page_url} -> {entry}")
 
     return MultiPageDeviceAudit(
         name=profile_name,
         pages_checked=pages_checked,
         avg_load_ms=avg_load_ms,
         nav_ok=nav_ok,
+        nav_note=(
+            "All pages passed nav check"
+            if nav_ok
+            else f"Nav failed on page(s): {', '.join(failed_nav_pages[:5])}"
+        ),
         links_ok=links_ok,
-        links_note=f"{pages_checked} pages checked; link-check failures on {failed_links} page(s)",
+        links_note=(
+            f"{pages_checked} pages checked; link-check failures on {failed_links} page(s)"
+            if links_ok
+            else f"{pages_checked} pages checked; failures: {' | '.join(failed_link_entries[:8])}"
+        ),
         phone_ok=phone_ok,
+        phone_note=(
+            "Phone found in header/top-nav on all pages"
+            if phone_ok
+            else f"Phone missing on: {' | '.join(failed_phone_pages[:8])}"
+        ),
         footer_ok=footer_ok,
-        footer_note=f"{pages_checked} pages checked; footer-check failures on {failed_footer} page(s)",
+        footer_note=(
+            f"{pages_checked} pages checked; footer-check failures on {failed_footer} page(s)"
+            if footer_ok
+            else f"{pages_checked} pages checked; footer failures: {' | '.join(failed_footer_entries[:8])}"
+        ),
     )
 
 
@@ -345,13 +465,17 @@ def build_results(url: str, max_pages: int = MAX_PAGES_TO_AUDIT) -> List[CheckRe
     desktop_cwv_ok, desktop_cwv_note = False, "Unavailable"
     mobile_cwv_ok, mobile_cwv_note = False, "Unavailable"
     try:
-        desktop_payload = fetch_pagespeed_result(url, "desktop")
+        desktop_payload = fetch_pagespeed_with_retry(url, "desktop")
         desktop_ok, desktop_note = extract_core_web_vitals_pass(desktop_payload)
         desktop_cwv_ok, desktop_cwv_note = desktop_ok, desktop_note
     except (HTTPError, URLError, ValueError, KeyError) as exc:
         desktop_cwv_note = f"PSI error: {exc}"
+
+    # Cool down between PSI calls to reduce API throttling.
+    time.sleep(PSI_COOLDOWN_SECONDS)
+
     try:
-        mobile_payload = fetch_pagespeed_result(url, "mobile")
+        mobile_payload = fetch_pagespeed_with_retry(url, "mobile")
         mobile_ok, mobile_note = extract_core_web_vitals_pass(mobile_payload)
         mobile_cwv_ok, mobile_cwv_note = mobile_ok, mobile_note
     except (HTTPError, URLError, ValueError, KeyError) as exc:
@@ -387,7 +511,7 @@ def build_results(url: str, max_pages: int = MAX_PAGES_TO_AUDIT) -> List[CheckRe
             desktop=pf(desktop.nav_ok),
             mobile=pf(mobile.nav_ok),
             tablet=pf(tablet.nav_ok),
-            notes="Device-emulated check for nav and responsive menu hints.",
+            notes=f"D:{desktop.nav_note} | M:{mobile.nav_note} | T:{tablet.nav_note}",
         ),
         CheckResult(
             component="Working links & buttons",
@@ -403,7 +527,7 @@ def build_results(url: str, max_pages: int = MAX_PAGES_TO_AUDIT) -> List[CheckRe
             desktop=pf(desktop.phone_ok),
             mobile=pf(mobile.phone_ok),
             tablet=pf(tablet.phone_ok),
-            notes=f"Device-emulated header text phone regex across {len(pages)} page(s).",
+            notes=f"D:{desktop.phone_note} | M:{mobile.phone_note} | T:{tablet.phone_note}",
         ),
         CheckResult(
             component="Footer functionality - working links",

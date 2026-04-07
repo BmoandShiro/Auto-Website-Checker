@@ -8,11 +8,12 @@ import sys
 from dataclasses import asdict
 from typing import List
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -86,10 +87,19 @@ class MainWindow(QMainWindow):
                 "Notes",
             ]
         )
+        self.table.setWordWrap(True)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
+
+        footer_row = QHBoxLayout()
         self.credit_label = QLabel("Created by: BMOandShiro")
-        layout.addWidget(self.credit_label)
+        self.version_label = QLabel("v0.1.0-alpha")
+        footer_row.addWidget(self.credit_label)
+        footer_row.addStretch()
+        footer_row.addWidget(self.version_label)
+        layout.addLayout(footer_row)
 
     @staticmethod
     def _style_result_cell(item: QTableWidgetItem, value: str) -> None:
@@ -132,6 +142,7 @@ class MainWindow(QMainWindow):
                 item = QTableWidgetItem(str(value))
                 self._style_result_cell(item, str(value))
                 self.table.setItem(row_idx, col_idx, item)
+        self.table.resizeRowsToContents()
 
         self.run_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
