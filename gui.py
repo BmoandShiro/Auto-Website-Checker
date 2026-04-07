@@ -37,9 +37,10 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QSizePolicy,
+    QToolButton,
 )
 
-from main import CheckResult, build_results
+from main import QA_ROW_OPTIONS, CheckResult, build_results
 
 
 SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "settings.json")
@@ -122,11 +123,35 @@ class SettingsDialog(QDialog):
         }
 
 
+class RowConfigDialog(QDialog):
+    def __init__(self, current: dict, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("QA Row Config")
+        layout = QVBoxLayout(self)
+        self.checkboxes: dict[str, QCheckBox] = {}
+        enabled_rows = current.get("enabled_rows") or {}
+        for key, label in QA_ROW_OPTIONS:
+            cb = QCheckBox(label)
+            cb.setChecked(bool(enabled_rows.get(key, True)))
+            self.checkboxes[key] = cb
+            layout.addWidget(cb)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_rows(self) -> dict:
+        return {k: bool(cb.isChecked()) for k, cb in self.checkboxes.items()}
+
+
 class AuditWorker(QThread):
     finished_ok = pyqtSignal(list)
     row_ready = pyqtSignal(object)
     status = pyqtSignal(str)
     social_links_ready = pyqtSignal(list, list)
+    pages_checked_ready = pyqtSignal(list)
+    spelling_issues_ready = pyqtSignal(list)
+    row_details_ready = pyqtSignal(dict)
     progress_non_cwv = pyqtSignal(int, int)
     progress_cwv = pyqtSignal(int, int)
     failed = pyqtSignal(str)
@@ -153,11 +178,23 @@ class AuditWorker(QThread):
             def emit_social_links(links: list, conflicts: list) -> None:
                 self.social_links_ready.emit(links, conflicts)
 
+            def emit_pages_checked(pages: list) -> None:
+                self.pages_checked_ready.emit(pages)
+
+            def emit_spelling_issues(words: list) -> None:
+                self.spelling_issues_ready.emit(words)
+
+            def emit_row_details(details: dict) -> None:
+                self.row_details_ready.emit(details)
+
             results = build_results(
                 self.url,
                 on_row=emit_row,
                 on_status=emit_status,
                 on_social_links=emit_social_links,
+                on_pages_checked=emit_pages_checked,
+                on_spelling_issues=emit_spelling_issues,
+                on_row_details=emit_row_details,
                 on_progress_non_cwv=emit_progress,
                 on_progress_cwv=emit_progress_cwv,
                 settings=self.settings,
@@ -174,6 +211,7 @@ class MainWindow(QMainWindow):
         self.resize(1100, 600)
         self.settings = self._load_settings()
         self.results: List[CheckResult] = []
+        self.row_details_map: dict = {}
         self.worker: AuditWorker | None = None
 
         central = QWidget()
@@ -198,6 +236,9 @@ class MainWindow(QMainWindow):
         self.settings_btn = QPushButton("Settings")
         self.settings_btn.clicked.connect(self.open_settings)
         url_row.addWidget(self.settings_btn)
+        self.config_btn = QPushButton("Config")
+        self.config_btn.clicked.connect(self.open_row_config)
+        url_row.addWidget(self.config_btn)
         layout.addLayout(url_row)
 
         business_row = QHBoxLayout()
@@ -243,14 +284,47 @@ class MainWindow(QMainWindow):
         self.table.setColumnWidth(0, 430)
         self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.table.setMinimumHeight(280)
+        self.table.cellClicked.connect(self.on_table_cell_clicked)
         layout.addWidget(self.table)
 
         self.social_label = QLabel("Social links (double-click to open)")
         layout.addWidget(self.social_label)
+        self.social_toggle = QToolButton()
+        self.social_toggle.setText("Social links \u25be")
+        self.social_toggle.setCheckable(True)
+        self.social_toggle.setChecked(False)
+        self.social_toggle.toggled.connect(self.toggle_social_panel)
+        layout.addWidget(self.social_toggle)
         self.social_list = QListWidget()
         self.social_list.itemDoubleClicked.connect(self.open_social_link)
         self.social_list.setMinimumHeight(120)
+        self.social_list.setVisible(False)
         layout.addWidget(self.social_list)
+
+        self.pages_toggle = QToolButton()
+        self.pages_toggle.setText("Pages checked \u25be")
+        self.pages_toggle.setCheckable(True)
+        self.pages_toggle.setChecked(False)
+        self.pages_toggle.toggled.connect(self.toggle_pages_panel)
+        layout.addWidget(self.pages_toggle)
+
+        self.pages_list = QListWidget()
+        self.pages_list.setVisible(False)
+        self.pages_list.setMinimumHeight(100)
+        self.pages_list.itemDoubleClicked.connect(self.open_page_link)
+        layout.addWidget(self.pages_list)
+
+        self.spell_toggle = QToolButton()
+        self.spell_toggle.setText("Spelling/grammar unknown words \u25be")
+        self.spell_toggle.setCheckable(True)
+        self.spell_toggle.setChecked(False)
+        self.spell_toggle.toggled.connect(self.toggle_spell_panel)
+        layout.addWidget(self.spell_toggle)
+
+        self.spell_list = QListWidget()
+        self.spell_list.setVisible(False)
+        self.spell_list.setMinimumHeight(100)
+        layout.addWidget(self.spell_list)
         layout.setStretch(0, 0)  # URL row
         layout.setStretch(1, 0)  # business row
         layout.setStretch(2, 0)  # status
@@ -260,8 +334,13 @@ class MainWindow(QMainWindow):
         layout.setStretch(6, 0)  # CWV bar
         layout.setStretch(7, 1)  # table gets remaining height
         layout.setStretch(8, 0)  # social label
-        layout.setStretch(9, 0)  # social list
-        layout.setStretch(10, 0)  # footer
+        layout.setStretch(9, 0)  # social toggle
+        layout.setStretch(10, 0)  # social list
+        layout.setStretch(11, 0)  # pages toggle
+        layout.setStretch(12, 0)  # pages list
+        layout.setStretch(13, 0)  # spell toggle
+        layout.setStretch(14, 0)  # spell list
+        layout.setStretch(15, 0)  # footer
 
         footer_row = QHBoxLayout()
         self.credit_label = QLabel("Created by: BMOandShiro")
@@ -290,8 +369,15 @@ class MainWindow(QMainWindow):
         self.run_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
         self.results = []
+        self.row_details_map = {}
         self.table.setRowCount(0)
         self.social_list.clear()
+        self.social_toggle.setChecked(False)
+        self.social_toggle.setText("Social links \u25be")
+        self.pages_list.clear()
+        self.spell_list.clear()
+        self.spell_toggle.setChecked(False)
+        self.spell_toggle.setText("Spelling/grammar unknown words \u25be")
         self.social_label.setText("Social links (double-click to open)")
         self.status_label.setText("Running checks... this may take a minute.")
         self.progress_non_cwv_bar.setValue(0)
@@ -303,6 +389,9 @@ class MainWindow(QMainWindow):
         self.worker.row_ready.connect(self._append_row)
         self.worker.status.connect(self.status_label.setText)
         self.worker.social_links_ready.connect(self.on_social_links_ready)
+        self.worker.pages_checked_ready.connect(self.on_pages_checked_ready)
+        self.worker.spelling_issues_ready.connect(self.on_spelling_issues_ready)
+        self.worker.row_details_ready.connect(self.on_row_details_ready)
         self.worker.progress_non_cwv.connect(self.on_progress_non_cwv)
         self.worker.progress_cwv.connect(self.on_progress_cwv)
         self.worker.failed.connect(self.on_error)
@@ -331,6 +420,13 @@ class MainWindow(QMainWindow):
             self._save_settings()
             mode = "CrUX-first" if self.settings.get("prefer_crux_first") else "PSI-first"
             self.status_label.setText(f"Settings saved ({mode}).")
+
+    def open_row_config(self) -> None:
+        dialog = RowConfigDialog(self.settings, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.settings["enabled_rows"] = dialog.selected_rows()
+            self._save_settings()
+            self.status_label.setText("Row config saved.")
 
     def on_success(self, results: list) -> None:
         self.results = results
@@ -368,8 +464,9 @@ class MainWindow(QMainWindow):
 
     def _append_row(self, result: CheckResult) -> None:
         row = asdict(result)
+        component_label = f"\u25b8 {row['component']}"
         values = [
-            row["component"],
+            component_label,
             row["yes_no"],
             row["desktop"],
             row["mobile"],
@@ -406,7 +503,94 @@ class MainWindow(QMainWindow):
         else:
             self.social_label.setText("Social links (double-click to open)")
 
+    def toggle_social_panel(self, checked: bool) -> None:
+        self.social_list.setVisible(checked)
+        self.social_toggle.setText("Social links \u25b4" if checked else "Social links \u25be")
+
+    def on_pages_checked_ready(self, pages: list) -> None:
+        self.pages_list.clear()
+        for page in pages:
+            item = QListWidgetItem(page)
+            item.setData(Qt.ItemDataRole.UserRole, page)
+            self.pages_list.addItem(item)
+
+    def toggle_pages_panel(self, checked: bool) -> None:
+        self.pages_list.setVisible(checked)
+        self.pages_toggle.setText("Pages checked \u25b4" if checked else "Pages checked \u25be")
+
+    def on_spelling_issues_ready(self, words: list) -> None:
+        self.spell_list.clear()
+        for word in words:
+            self.spell_list.addItem(QListWidgetItem(word))
+
+    def toggle_spell_panel(self, checked: bool) -> None:
+        self.spell_list.setVisible(checked)
+        self.spell_toggle.setText(
+            "Spelling/grammar unknown words \u25b4" if checked else "Spelling/grammar unknown words \u25be"
+        )
+
+    def on_row_details_ready(self, details: dict) -> None:
+        self.row_details_map = details
+
+    def _is_detail_row(self, row: int) -> bool:
+        item = self.table.item(row, 0)
+        return bool(item and item.data(Qt.ItemDataRole.UserRole) == "detail_row")
+
+    def _component_name_for_row(self, row: int) -> str:
+        item = self.table.item(row, 0)
+        if not item:
+            return ""
+        text = item.text().strip()
+        if text.startswith("\u25b8 ") or text.startswith("\u25be "):
+            return text[2:].strip()
+        return text
+
+    def on_table_cell_clicked(self, row: int, column: int) -> None:
+        if column != 0 or self._is_detail_row(row):
+            return
+        component = self._component_name_for_row(row)
+        if not component:
+            return
+        # Toggle inline detail row directly below the clicked QA row.
+        if row + 1 < self.table.rowCount() and self._is_detail_row(row + 1):
+            self.table.removeRow(row + 1)
+            base_item = self.table.item(row, 0)
+            if base_item:
+                base_item.setText(f"\u25b8 {component}")
+            return
+
+        payload = self.row_details_map.get(component, {"problematic": [], "ok": []})
+        bad = payload.get("problematic", []) or []
+        ok = payload.get("ok", []) or []
+        lines = [f"Problematic ({len(bad)}):"]
+        lines.extend(f"- {x}" for x in bad[:200])
+        lines.append("")
+        lines.append(f"OK ({len(ok)}):")
+        lines.extend(f"- {x}" for x in ok[:200])
+        detail_text = "\n".join(lines)
+
+        self.table.insertRow(row + 1)
+        detail_item = QTableWidgetItem("   details")
+        detail_item.setData(Qt.ItemDataRole.UserRole, "detail_row")
+        self.table.setItem(row + 1, 0, detail_item)
+        for col in range(1, 5):
+            empty = QTableWidgetItem("")
+            empty.setData(Qt.ItemDataRole.UserRole, "detail_row")
+            self.table.setItem(row + 1, col, empty)
+        notes_item = QTableWidgetItem(detail_text)
+        notes_item.setData(Qt.ItemDataRole.UserRole, "detail_row")
+        self.table.setItem(row + 1, 5, notes_item)
+        base_item = self.table.item(row, 0)
+        if base_item:
+            base_item.setText(f"\u25be {component}")
+        self.table.resizeRowsToContents()
+
     def open_social_link(self, item: QListWidgetItem) -> None:
+        url = item.data(Qt.ItemDataRole.UserRole)
+        if url:
+            webbrowser.open(url)
+
+    def open_page_link(self, item: QListWidgetItem) -> None:
         url = item.data(Qt.ItemDataRole.UserRole)
         if url:
             webbrowser.open(url)

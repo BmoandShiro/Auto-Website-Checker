@@ -33,6 +33,21 @@ PREFER_CRUX_FIRST = True
 ENABLE_CORE_WEB_VITALS = False
 PHONE_PATTERN = re.compile(r"\+?\d[\d\-\(\)\s]{7,}\d")
 LAST_REQUEST_TS = 0.0
+QA_ROW_OPTIONS = [
+    ("passable_design", "If Inheriting an Exiting Website: Is it a passable design?"),
+    ("speed_snappy", "Fast website/page load speed (Does it feel fast/snappy?)"),
+    ("nav_responsive", "Navigation bar functionality - responsive menu bar"),
+    ("links_buttons", "Working links & buttons"),
+    ("phone_in_header", "Phone Number Present in Head (NOT Only Book Online)"),
+    ("footer_links", "Footer functionality - working links"),
+    ("spelling_grammar", "Correct spelling & grammar, no typos"),
+    ("images_quality", "Images are compressed, high resolution, not blurry or pixelated"),
+    ("videos_load", "Videos load correctly"),
+    ("social_links", "Social media links out to correct pages"),
+    ("business_name", "Using correct business name"),
+    ("rise_compat", "Rise Plugin Compatible (Wordpress)"),
+    ("core_web_vitals", "Core Web Vitals"),
+]
 
 
 @dataclass
@@ -54,6 +69,7 @@ class DeviceAudit:
     links_ok: bool
     links_note: str
     links_failed: List[str]
+    links_ok_urls: List[str]
     phone_ok: bool
     phone_note: str
     footer_ok: bool
@@ -158,23 +174,26 @@ def normalize_links(base_url: str, links: List[str]) -> List[str]:
     return deduped
 
 
-def check_link_set(urls: List[str], max_to_check: int | None = None) -> Tuple[bool, str, List[str]]:
+def check_link_set(urls: List[str], max_to_check: int | None = None) -> Tuple[bool, str, List[str], List[str]]:
     if max_to_check is None:
         max_to_check = MAX_LINKS_PER_CHECK
     if not urls:
-        return False, "No links found", []
+        return False, "No links found", [], []
     tested = 0
     failed: List[Tuple[str, int]] = []
+    succeeded: List[str] = []
     for link in urls[:max_to_check]:
         status = fetch_status(link)
         tested += 1
         if status == 0 or status >= 400:
             failed.append((link, status))
+        else:
+            succeeded.append(f"{link} ({status})")
     if failed:
         preview = ", ".join(f"{u} ({s})" for u, s in failed[:5])
         failure_urls = [f"{u} ({s})" for u, s in failed]
-        return False, f"{len(failed)}/{tested} failed: {preview}", failure_urls
-    return True, f"Checked {tested} links, all OK", []
+        return False, f"{len(failed)}/{tested} failed: {preview}", failure_urls, succeeded
+    return True, f"Checked {tested} links, all OK", [], succeeded
 
 
 def fetch_pagespeed_result(url: str, strategy: str, api_key: str = "") -> Dict[str, object]:
@@ -349,9 +368,58 @@ def discover_internal_pages(seed_url: str, max_pages: int | None = None) -> List
     except Exception:
         return pages
 
-    hrefs = re.findall(r'href\s*=\s*["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
-    candidates = normalize_links(seed_url, hrefs)
-    for candidate in candidates:
+    def path_depth(u: str) -> int:
+        path = urlparse(u).path.strip("/")
+        if not path:
+            return 0
+        return len([p for p in path.split("/") if p])
+
+    def top_section(u: str) -> str:
+        path = urlparse(u).path.strip("/")
+        if not path:
+            return ""
+        return path.split("/")[0].lower()
+
+    # Prioritize top-level/header nav links first.
+    nav_href_matches = re.findall(r"<nav[\s\S]*?</nav>", html, flags=re.IGNORECASE)
+    nav_hrefs: List[str] = []
+    for block in nav_href_matches:
+        nav_hrefs.extend(re.findall(r'href\s*=\s*["\']([^"\']+)["\']', block, flags=re.IGNORECASE))
+    nav_candidates = normalize_links(seed_url, nav_hrefs)
+
+    all_hrefs = re.findall(r'href\s*=\s*["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    all_candidates = normalize_links(seed_url, all_hrefs)
+
+    # 1) Add nav links with section diversity first:
+    # pick one per top-level section before taking additional nested links.
+    nav_candidates = [u for u in nav_candidates if get_hostname(u) == seed_host]
+    by_section: Dict[str, List[str]] = {}
+    for candidate in nav_candidates:
+        by_section.setdefault(top_section(candidate), []).append(candidate)
+
+    # First pass: one URL per section.
+    for section in by_section.keys():
+        if len(pages) >= max_pages:
+            break
+        # Prefer shallower link within each section but keep source-order tie-break.
+        first = min(by_section[section], key=lambda u: path_depth(u))
+        if first not in pages:
+            pages.append(first)
+
+    # Second pass: remaining nav URLs (still shallow-first) to fill leftover slots.
+    for section in by_section.keys():
+        remaining = [u for u in by_section[section] if u != min(by_section[section], key=lambda x: path_depth(x))]
+        for candidate in remaining:
+            if len(pages) >= max_pages:
+                break
+            if candidate not in pages:
+                pages.append(candidate)
+        if len(pages) >= max_pages:
+            break
+
+    # 2) Fill remaining slots with other homepage links, still preferring shallower pages.
+    all_candidates = sorted(all_candidates, key=lambda u: (path_depth(u), u))
+    for candidate in all_candidates:
         if len(pages) >= max_pages:
             break
         if get_hostname(candidate) != seed_host:
@@ -392,7 +460,7 @@ def check_social_links(url: str, html: str) -> Tuple[bool, str]:
     socials = [l for l in links if any(domain in l.lower() for domain in social_domains)]
     if not socials:
         return False, "No social links found"
-    ok, note, failures = check_link_set(socials, max_to_check=20)
+    ok, note, failures, _ok_urls = check_link_set(socials, max_to_check=20)
     if ok:
         return True, f"Checked {len(socials)} social link(s), all OK"
     return False, f"{note}; failures={', '.join(failures[:5])}"
@@ -489,15 +557,15 @@ def extract_visible_text(html: str) -> str:
     return text
 
 
-def check_spelling_grammar(pages_html: List[str]) -> Tuple[bool, str]:
+def check_spelling_grammar(pages_html: List[str]) -> Tuple[bool, str, List[str]]:
     sample_text = " ".join(extract_visible_text(h) for h in pages_html if h)
     words = re.findall(r"\b[a-zA-Z]{4,}\b", sample_text)
     if len(words) < 40:
-        return False, "Insufficient textual content for automated check"
+        return False, "Insufficient textual content for automated check", []
     try:
         from spellchecker import SpellChecker  # type: ignore
     except Exception:
-        return False, "Spell checker package unavailable (install pyspellchecker)"
+        return False, "Spell checker package unavailable (install pyspellchecker)", []
 
     spell = SpellChecker()
     # limit sample for speed on very large pages
@@ -505,26 +573,29 @@ def check_spelling_grammar(pages_html: List[str]) -> Tuple[bool, str]:
     unknown = spell.unknown(subset)
     error_rate = (len(unknown) / max(1, len(set(subset)))) * 100
     passed = error_rate <= 3.0
-    return passed, f"Spelling heuristic unknown-word rate={error_rate:.1f}% (threshold<=3.0%)"
+    unknown_list = sorted(list(unknown))[:200]
+    return passed, f"Spelling heuristic unknown-word rate={error_rate:.1f}% (threshold<=3.0%)", unknown_list
 
 
-def check_image_quality(url: str, pages_html: List[str]) -> Tuple[bool, str]:
+def check_image_quality(url: str, pages_html: List[str]) -> Tuple[bool, str, List[str], List[str]]:
     try:
         from PIL import Image, ImageFilter, ImageStat  # type: ignore
         from io import BytesIO
     except Exception:
-        return False, "Pillow unavailable (install pillow)"
+        return False, "Pillow unavailable (install pillow)", [], []
 
     srcs: List[str] = []
     for html in pages_html:
         srcs.extend(re.findall(r'<img[^>]+src\s*=\s*["\']([^"\']+)["\']', html, flags=re.IGNORECASE))
     image_urls = normalize_links(url, srcs)[:20]
     if not image_urls:
-        return False, "No image URLs found"
+        return False, "No image URLs found", [], []
 
     checked = 0
     blurry = 0
     low_res = 0
+    bad_urls: List[str] = []
+    ok_urls: List[str] = []
     for img_url in image_urls:
         try:
             req = Request(img_url, headers={"User-Agent": USER_AGENT})
@@ -537,29 +608,58 @@ def check_image_quality(url: str, pages_html: List[str]) -> Tuple[bool, str]:
                 low_res += 1
             edges = img.filter(ImageFilter.FIND_EDGES)
             var = ImageStat.Stat(edges).var[0]
+            is_bad = False
             if var < 60:
                 blurry += 1
+                is_bad = True
+            if w < 300 or h < 200:
+                is_bad = True
+            if is_bad:
+                bad_urls.append(f"{img_url} (w={w}, h={h}, edge_var={var:.1f})")
+            else:
+                ok_urls.append(f"{img_url} (w={w}, h={h}, edge_var={var:.1f})")
         except Exception:
             continue
     if checked == 0:
-        return False, "Could not analyze images"
+        return False, "Could not analyze images", [], []
     passed = (blurry / checked) <= 0.4 and (low_res / checked) <= 0.5
-    return passed, f"Checked {checked} images; blurry={blurry}, low_res={low_res}"
+    return passed, f"Checked {checked} images; blurry={blurry}, low_res={low_res}", bad_urls, ok_urls
 
 
-def check_videos_load(url: str, pages_html: List[str]) -> Tuple[bool, str]:
+def check_videos_load(url: str, pages_html: List[str]) -> Tuple[bool, str, List[str], List[str]]:
     srcs: List[str] = []
     for html in pages_html:
         srcs.extend(re.findall(r"<video[^>]+src\s*=\s*['\"]([^'\"]+)['\"]", html, flags=re.IGNORECASE))
         srcs.extend(re.findall(r"<source[^>]+src\s*=\s*['\"]([^'\"]+)['\"]", html, flags=re.IGNORECASE))
-        srcs.extend(re.findall(r"<iframe[^>]+src\s*=\s*['\"]([^'\"]+)['\"]", html, flags=re.IGNORECASE))
+        iframe_srcs = re.findall(r"<iframe[^>]+src\s*=\s*['\"]([^'\"]+)['\"]", html, flags=re.IGNORECASE)
+        # Keep likely video embeds; exclude maps and generic widgets.
+        for iframe_src in iframe_srcs:
+            lower = iframe_src.lower()
+            if any(x in lower for x in ("youtube.com", "youtu.be", "vimeo.com", "wistia.com", "loom.com", "player.")):
+                srcs.append(iframe_src)
     video_urls = normalize_links(url, srcs)[:20]
     if not video_urls:
-        return False, "No video/iframe sources found"
-    ok, note, failures = check_link_set(video_urls, max_to_check=20)
-    if ok:
-        return True, f"Checked {len(video_urls)} video source URL(s), all reachable"
-    return False, f"{note}; failures={', '.join(failures[:5])}"
+        return True, "No video sources found on checked pages", [], []
+    tested = 0
+    failures: List[str] = []
+    ok_urls: List[str] = []
+    known_embed_domains = ("youtube.com", "youtu.be", "vimeo.com", "wistia.com", "loom.com")
+    for video_url in video_urls[:20]:
+        status = fetch_status(video_url)
+        tested += 1
+        # Many video hosts legitimately return 403/405 to bot-like checks while embeds still work in-browser.
+        if status == 0:
+            failures.append(f"{video_url} (no response)")
+        elif status >= 400:
+            if status in (403, 405) and any(d in video_url.lower() for d in known_embed_domains):
+                ok_urls.append(f"{video_url} ({status}, embed-allowed)")
+                continue
+            failures.append(f"{video_url} ({status})")
+        else:
+            ok_urls.append(f"{video_url} ({status})")
+    if failures:
+        return False, f"{len(failures)}/{tested} source checks failed; failures={', '.join(failures[:5])}", failures, ok_urls
+    return True, f"Checked {tested} video source URL(s), all reachable/allowed", [], ok_urls
 
 
 def check_business_name(pages_html: List[str], expected_business_name: str) -> Tuple[bool, str]:
@@ -645,6 +745,7 @@ def audit_device(context: BrowserContext, url: str, profile_name: str) -> Device
             links_ok=False,
             links_note=f"Page timeout/error after {TIMEOUT_SECONDS}s",
             links_failed=[f"{url} (timeout/error)"],
+            links_ok_urls=[],
             phone_ok=False,
             phone_note=f"Page timeout/error after {TIMEOUT_SECONDS}s",
             footer_ok=False,
@@ -678,8 +779,8 @@ def audit_device(context: BrowserContext, url: str, profile_name: str) -> Device
         url, page.eval_on_selector_all("footer a[href]", "els => els.map(e => e.getAttribute('href') || '')")
     )
 
-    links_ok, links_note, links_failed = check_link_set(all_links)
-    footer_ok, footer_note, footer_failed = check_link_set(footer_links)
+    links_ok, links_note, links_failed, links_ok_urls = check_link_set(all_links)
+    footer_ok, footer_note, footer_failed, _footer_ok_urls = check_link_set(footer_links)
 
     phone_ok, phone_note = detect_phone_in_header(page)
 
@@ -692,6 +793,7 @@ def audit_device(context: BrowserContext, url: str, profile_name: str) -> Device
         links_ok=links_ok,
         links_note=links_note,
         links_failed=links_failed,
+        links_ok_urls=links_ok_urls,
         phone_ok=phone_ok,
         phone_note=phone_note,
         footer_ok=footer_ok,
@@ -769,8 +871,9 @@ def combine_device_audits(profile_name: str, audits: List[DeviceAudit]) -> Multi
     )
 
 
-def run_device_audits(urls: List[str], on_audit_complete=None) -> Dict[str, MultiPageDeviceAudit]:
-    audits: Dict[str, DeviceAudit] = {}
+def run_device_audits(
+    urls: List[str], on_audit_complete=None
+) -> Tuple[Dict[str, MultiPageDeviceAudit], Dict[str, List[DeviceAudit]]]:
     by_profile: Dict[str, List[DeviceAudit]] = {p.name: [] for p in DEVICE_PROFILES}
     with sync_playwright() as p:
         browser: Browser = p.chromium.launch(headless=True)
@@ -794,7 +897,7 @@ def run_device_audits(urls: List[str], on_audit_complete=None) -> Dict[str, Mult
     merged: Dict[str, MultiPageDeviceAudit] = {}
     for profile in DEVICE_PROFILES:
         merged[profile.name] = combine_device_audits(profile.name, by_profile[profile.name])
-    return merged
+    return merged, by_profile
 
 
 def build_results(
@@ -803,6 +906,9 @@ def build_results(
     on_row=None,
     on_status=None,
     on_social_links=None,
+    on_pages_checked=None,
+    on_spelling_issues=None,
+    on_row_details=None,
     on_progress_non_cwv=None,
     on_progress_cwv=None,
     settings: Dict[str, object] | None = None,
@@ -819,6 +925,13 @@ def build_results(
         out.append(row)
         if on_row:
             on_row(row)
+
+    enabled_rows = ((settings or {}).get("enabled_rows") or {})
+
+    def row_enabled(row_key: str) -> bool:
+        if not enabled_rows:
+            return True
+        return bool(enabled_rows.get(row_key, True))
 
     non_cwv_total = 1
     non_cwv_done = 0
@@ -891,11 +1004,12 @@ def build_results(
         lighthouse_ok, lighthouse_note = run_local_lighthouse_cwv(url, strategy)
         return lighthouse_ok, f"{psi_error or 'CWV unavailable'}; fallback={lighthouse_note}"
 
-    init_cwv(2 if ENABLE_CORE_WEB_VITALS else 1)
+    run_cwv_row = row_enabled("core_web_vitals")
+    init_cwv(2 if (ENABLE_CORE_WEB_VITALS and run_cwv_row) else 1)
 
     def run_cwv_flow() -> None:
         nonlocal desktop_cwv_ok, desktop_cwv_note, mobile_cwv_ok, mobile_cwv_note
-        if ENABLE_CORE_WEB_VITALS:
+        if ENABLE_CORE_WEB_VITALS and run_cwv_row:
             emit_status("Checking Core Web Vitals (desktop)...")
             desktop_cwv_ok, desktop_cwv_note = evaluate_cwv("desktop", "DESKTOP")
             step_cwv()
@@ -916,11 +1030,14 @@ def build_results(
 
     emit_status("Discovering internal pages...")
     pages = discover_internal_pages(url, max_pages=max_pages)
-    non_cwv_steps = 1 + (len(pages) * len(DEVICE_PROFILES)) + 13
+    if on_pages_checked:
+        on_pages_checked(pages)
+    selected_non_cwv_rows = sum(1 for key, _ in QA_ROW_OPTIONS if key != "core_web_vitals" and row_enabled(key))
+    non_cwv_steps = 1 + (len(pages) * len(DEVICE_PROFILES)) + selected_non_cwv_rows
     init_non_cwv(non_cwv_steps)
     step_non_cwv()
     emit_status(f"Auditing {len(pages)} page(s) across desktop/mobile/tablet...")
-    audits = run_device_audits(pages, on_audit_complete=step_non_cwv)
+    audits, raw_audits = run_device_audits(pages, on_audit_complete=step_non_cwv)
 
     desktop = audits["desktop"]
     mobile = audits["mobile"]
@@ -934,25 +1051,37 @@ def build_results(
             continue
     homepage_html = pages_html[0] if pages_html else ""
     expected_business_name = str((settings or {}).get("expected_business_name", "")).strip()
-    social_ok, social_note = (
-        check_social_links_with_business_hint(url, homepage_html, expected_business_name)
-        if homepage_html
-        else (False, "Unable to fetch page HTML")
-    )
+    social_ok, social_note = (False, "Skipped by config")
+    if row_enabled("social_links"):
+        social_ok, social_note = (
+            check_social_links_with_business_hint(url, homepage_html, expected_business_name)
+            if homepage_html
+            else (False, "Unable to fetch page HTML")
+        )
     social_inventory, social_conflicts = get_social_link_inventory(url, homepage_html) if homepage_html else ([], [])
     if on_social_links:
         on_social_links(social_inventory, social_conflicts)
-    noindex_ok, noindex_note = check_noindex_discouraged(url, homepage_html) if homepage_html else (False, "Unable to fetch page HTML")
-    spell_ok, spell_note = check_spelling_grammar(pages_html)
-    img_ok, img_note = check_image_quality(url, pages_html)
-    video_ok, video_note = check_videos_load(url, pages_html)
-    name_ok, name_note = check_business_name(pages_html, expected_business_name)
+    spell_ok, spell_note, spelling_issues = (False, "Skipped by config", [])
+    if row_enabled("spelling_grammar"):
+        spell_ok, spell_note, spelling_issues = check_spelling_grammar(pages_html)
+        if on_spelling_issues:
+            on_spelling_issues(spelling_issues)
+    img_ok, img_note, image_bad, image_ok = (False, "Skipped by config", [], [])
+    if row_enabled("images_quality"):
+        img_ok, img_note, image_bad, image_ok = check_image_quality(url, pages_html)
+    video_ok, video_note, video_bad, video_ok_urls = (False, "Skipped by config", [], [])
+    if row_enabled("videos_load"):
+        video_ok, video_note, video_bad, video_ok_urls = check_videos_load(url, pages_html)
+    name_ok, name_note = (False, "Skipped by config")
+    if row_enabled("business_name"):
+        name_ok, name_note = check_business_name(pages_html, expected_business_name)
 
     rows: List[CheckResult] = []
     emit_status("Waiting for Core Web Vitals check to finish...")
     cwv_thread.join()
 
-    emit_row(
+    if row_enabled("passable_design"):
+        emit_row(
         CheckResult(
             component="If Inheriting an Exiting Website: Is it a passable design?",
             yes_no="TBD",
@@ -962,9 +1091,10 @@ def build_results(
             notes="Manual visual/brand quality review required per device.",
         ),
         rows,
-    )
-    step_non_cwv()
-    emit_row(
+        )
+        step_non_cwv()
+    if row_enabled("speed_snappy"):
+        emit_row(
         CheckResult(
             component="Fast website/page load speed (Does it feel fast/snappy?)",
             yes_no=yn(
@@ -981,9 +1111,10 @@ def build_results(
             ),
         ),
         rows,
-    )
-    step_non_cwv()
-    emit_row(
+        )
+        step_non_cwv()
+    if row_enabled("nav_responsive"):
+        emit_row(
         CheckResult(
             component="Navigation bar functionality - responsive menu bar",
             yes_no=yn(desktop.nav_ok and mobile.nav_ok and tablet.nav_ok),
@@ -993,9 +1124,10 @@ def build_results(
             notes=f"D:{desktop.nav_note} | M:{mobile.nav_note} | T:{tablet.nav_note}",
         ),
         rows,
-    )
-    step_non_cwv()
-    emit_row(
+        )
+        step_non_cwv()
+    if row_enabled("links_buttons"):
+        emit_row(
         CheckResult(
             component="Working links & buttons",
             yes_no=yn(desktop.links_ok and mobile.links_ok and tablet.links_ok),
@@ -1005,9 +1137,10 @@ def build_results(
             notes=f"D:{desktop.links_note} | M:{mobile.links_note} | T:{tablet.links_note}",
         ),
         rows,
-    )
-    step_non_cwv()
-    emit_row(
+        )
+        step_non_cwv()
+    if row_enabled("phone_in_header"):
+        emit_row(
         CheckResult(
             component="Phone Number Present in Head (NOT Only Book Online)",
             yes_no=yn(desktop.phone_ok and mobile.phone_ok and tablet.phone_ok),
@@ -1017,9 +1150,10 @@ def build_results(
             notes=f"D:{desktop.phone_note} | M:{mobile.phone_note} | T:{tablet.phone_note}",
         ),
         rows,
-    )
-    step_non_cwv()
-    emit_row(
+        )
+        step_non_cwv()
+    if row_enabled("footer_links"):
+        emit_row(
         CheckResult(
             component="Footer functionality - working links",
             yes_no=yn(desktop.footer_ok and mobile.footer_ok and tablet.footer_ok),
@@ -1029,9 +1163,10 @@ def build_results(
             notes=f"D:{desktop.footer_note} | M:{mobile.footer_note} | T:{tablet.footer_note}",
         ),
         rows,
-    )
-    step_non_cwv()
-    emit_row(
+        )
+        step_non_cwv()
+    if row_enabled("spelling_grammar"):
+        emit_row(
         CheckResult(
             component="Correct spelling & grammar, no typos",
             yes_no=yn(spell_ok),
@@ -1041,9 +1176,10 @@ def build_results(
             notes=spell_note,
         ),
         rows,
-    )
-    step_non_cwv()
-    emit_row(
+        )
+        step_non_cwv()
+    if row_enabled("images_quality"):
+        emit_row(
         CheckResult(
             component="Images are compressed, high resolution, not blurry or pixelated",
             yes_no=yn(img_ok),
@@ -1053,9 +1189,10 @@ def build_results(
             notes=f"Heuristic image-quality check. {img_note}",
         ),
         rows,
-    )
-    step_non_cwv()
-    emit_row(
+        )
+        step_non_cwv()
+    if row_enabled("videos_load"):
+        emit_row(
         CheckResult(
             component="Videos load correctly",
             yes_no=yn(video_ok),
@@ -1065,9 +1202,10 @@ def build_results(
             notes=f"Source-reachability check. {video_note}",
         ),
         rows,
-    )
-    step_non_cwv()
-    emit_row(
+        )
+        step_non_cwv()
+    if row_enabled("social_links"):
+        emit_row(
         CheckResult(
             component="Social media links out to correct pages",
             yes_no=yn(social_ok),
@@ -1080,21 +1218,10 @@ def build_results(
             ),
         ),
         rows,
-    )
-    step_non_cwv()
-    emit_row(
-        CheckResult(
-            component="Search Engine Visibility NOT Checked to Discourage Indexing",
-            yes_no=yn(noindex_ok),
-            desktop=pf(noindex_ok),
-            mobile=pf(noindex_ok),
-            tablet=pf(noindex_ok),
-            notes=noindex_note,
-        ),
-        rows,
-    )
-    step_non_cwv()
-    emit_row(
+        )
+        step_non_cwv()
+    if row_enabled("business_name"):
+        emit_row(
         CheckResult(
             component="Using correct business name",
             yes_no=yn(name_ok),
@@ -1104,9 +1231,10 @@ def build_results(
             notes=name_note,
         ),
         rows,
-    )
-    step_non_cwv()
-    emit_row(
+        )
+        step_non_cwv()
+    if row_enabled("rise_compat"):
+        emit_row(
         CheckResult(
             component="Rise Plugin Compatible (Wordpress)",
             yes_no=yn(is_wp),
@@ -1116,9 +1244,10 @@ def build_results(
             notes=wp_note,
         ),
         rows,
-    )
-    step_non_cwv()
-    emit_row(
+        )
+        step_non_cwv()
+    if row_enabled("core_web_vitals"):
+        emit_row(
         CheckResult(
             component="Core Web Vitals",
             yes_no=(
@@ -1163,8 +1292,51 @@ def build_results(
             notes=f"Desktop {desktop_cwv_note}; Mobile/Tablet {mobile_cwv_note}; pages_audited={len(pages)}",
         ),
         rows,
-    )
+        )
     emit_status("Finalizing results...")
+    if on_row_details:
+        working_links_bad: List[str] = []
+        working_links_ok: List[str] = []
+        slow_pages: List[str] = []
+        for device, audits_for_device in raw_audits.items():
+            for a in audits_for_device:
+                for bad in a.links_failed[:20]:
+                    working_links_bad.append(f"{device}: {a.page_url} -> {bad}")
+                for good in a.links_ok_urls[:20]:
+                    working_links_ok.append(f"{device}: {a.page_url} -> {good}")
+                if a.load_ms > FAST_LOAD_MS_THRESHOLD:
+                    slow_pages.append(f"{device}: {a.page_url} ({a.load_ms}ms)")
+        details = {
+            "Fast website/page load speed (Does it feel fast/snappy?)": {
+                "problematic": slow_pages,
+                "ok": [f"Threshold={FAST_LOAD_MS_THRESHOLD}ms"],
+            },
+            "Working links & buttons": {
+                "problematic": working_links_bad,
+                "ok": working_links_ok,
+            },
+            "Social media links out to correct pages": {
+                "problematic": [f"conflict: {c}" for c in social_conflicts],
+                "ok": [f"[{i['platform']}] {i['url']}" for i in social_inventory],
+            },
+            "Pages checked": {
+                "problematic": [],
+                "ok": pages,
+            },
+            "Correct spelling & grammar, no typos": {
+                "problematic": spelling_issues[:200],
+                "ok": [],
+            },
+            "Images are compressed, high resolution, not blurry or pixelated": {
+                "problematic": image_bad[:100],
+                "ok": image_ok[:100],
+            },
+            "Videos load correctly": {
+                "problematic": video_bad[:100],
+                "ok": video_ok_urls[:100],
+            },
+        }
+        on_row_details(details)
     return rows
 
 
