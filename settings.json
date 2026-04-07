@@ -7,5 +7,23 @@
   "request_throttle_seconds": 0.5,
   "prefer_crux_first": true,
   "enable_core_web_vitals": false,
-  "expected_business_name": "Renew Dental Loft"
+  "ui_font_size": 10,
+  "auto_save_last_run": true,
+  "results_history_dir": "C:\\Users\\nic\\Documents\\Repos\\Auto Website Checker\\run-history",
+  "expected_business_name": "Renew Dental Loft",
+  "enabled_rows": {
+    "passable_design": true,
+    "speed_snappy": true,
+    "nav_responsive": true,
+    "links_buttons": true,
+    "phone_in_header": true,
+    "footer_links": true,
+    "spelling_grammar": true,
+    "images_quality": true,
+    "videos_load": true,
+    "social_links": true,
+    "business_name": true,
+    "rise_compat": true,
+    "core_web_vitals": false
+  }
 }

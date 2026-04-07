@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import datetime
 import json
 import os
 import sys
@@ -32,6 +33,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QSpinBox,
+    QComboBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -54,6 +56,9 @@ DEFAULT_SETTINGS = {
     "prefer_crux_first": True,
     "enable_core_web_vitals": False,
     "expected_business_name": "",
+    "ui_font_size": 10,
+    "auto_save_last_run": True,
+    "results_history_dir": os.path.join(os.path.dirname(__file__), "run-history"),
 }
 
 
@@ -104,6 +109,15 @@ class SettingsDialog(QDialog):
         self.enable_cwv.setChecked(bool(current.get("enable_core_web_vitals", False)))
         form.addRow(self.enable_cwv)
 
+        self.ui_font_size = QSpinBox()
+        self.ui_font_size.setRange(8, 20)
+        self.ui_font_size.setValue(int(current.get("ui_font_size", 10)))
+        form.addRow("UI font size", self.ui_font_size)
+
+        self.auto_save_last_run = QCheckBox("Auto-save run results to history")
+        self.auto_save_last_run.setChecked(bool(current.get("auto_save_last_run", True)))
+        form.addRow(self.auto_save_last_run)
+
         layout.addLayout(form)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
@@ -120,6 +134,8 @@ class SettingsDialog(QDialog):
             "request_throttle_seconds": float(self.throttle.value()),
             "prefer_crux_first": bool(self.prefer_crux.isChecked()),
             "enable_core_web_vitals": bool(self.enable_cwv.isChecked()),
+            "ui_font_size": int(self.ui_font_size.value()),
+            "auto_save_last_run": bool(self.auto_save_last_run.isChecked()),
         }
 
 
@@ -212,6 +228,10 @@ class MainWindow(QMainWindow):
         self.settings = self._load_settings()
         self.results: List[CheckResult] = []
         self.row_details_map: dict = {}
+        self.latest_social_links: list = []
+        self.latest_social_conflicts: list = []
+        self.latest_pages_checked: list = []
+        self.latest_spelling_issues: list = []
         self.worker: AuditWorker | None = None
 
         central = QWidget()
@@ -250,9 +270,11 @@ class MainWindow(QMainWindow):
         layout.addLayout(business_row)
 
         self.status_label = QLabel("Enter a URL and click Run Check.")
+        self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.status_label)
 
         self.progress_non_cwv_label = QLabel("QA Checks Progress")
+        self.progress_non_cwv_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.progress_non_cwv_label)
         self.progress_non_cwv_bar = QProgressBar()
         self.progress_non_cwv_bar.setRange(0, 100)
@@ -260,6 +282,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress_non_cwv_bar)
 
         self.progress_cwv_label = QLabel("Core Web Vitals Progress")
+        self.progress_cwv_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.progress_cwv_label)
         self.progress_cwv_bar = QProgressBar()
         self.progress_cwv_bar.setRange(0, 100)
@@ -288,6 +311,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.table)
 
         self.social_label = QLabel("Social links (double-click to open)")
+        self.social_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.social_label)
         self.social_toggle = QToolButton()
         self.social_toggle.setText("Social links \u25be")
@@ -325,6 +349,15 @@ class MainWindow(QMainWindow):
         self.spell_list.setVisible(False)
         self.spell_list.setMinimumHeight(100)
         layout.addWidget(self.spell_list)
+
+        history_row = QHBoxLayout()
+        history_row.addWidget(QLabel("Recent runs:"))
+        self.history_combo = QComboBox()
+        history_row.addWidget(self.history_combo)
+        self.load_history_btn = QPushButton("Load")
+        self.load_history_btn.clicked.connect(self.load_selected_history_run)
+        history_row.addWidget(self.load_history_btn)
+        layout.addLayout(history_row)
         layout.setStretch(0, 0)  # URL row
         layout.setStretch(1, 0)  # business row
         layout.setStretch(2, 0)  # status
@@ -340,7 +373,8 @@ class MainWindow(QMainWindow):
         layout.setStretch(12, 0)  # pages list
         layout.setStretch(13, 0)  # spell toggle
         layout.setStretch(14, 0)  # spell list
-        layout.setStretch(15, 0)  # footer
+        layout.setStretch(15, 0)  # history row
+        layout.setStretch(16, 0)  # footer
 
         footer_row = QHBoxLayout()
         self.credit_label = QLabel("Created by: BMOandShiro")
@@ -349,6 +383,8 @@ class MainWindow(QMainWindow):
         footer_row.addStretch()
         footer_row.addWidget(self.version_label)
         layout.addLayout(footer_row)
+        self._apply_ui_font_size()
+        self.refresh_history_dropdown()
 
     @staticmethod
     def _style_result_cell(item: QTableWidgetItem, value: str) -> None:
@@ -413,11 +449,22 @@ class MainWindow(QMainWindow):
         with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
             json.dump(self.settings, f, indent=2)
 
+    def _apply_ui_font_size(self) -> None:
+        size = int(self.settings.get("ui_font_size", 10))
+        font = self.font()
+        font.setPointSize(size)
+        self.setFont(font)
+
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.settings = dialog.to_settings()
+            updated = dialog.to_settings()
+            updated["results_history_dir"] = self.settings.get("results_history_dir", DEFAULT_SETTINGS["results_history_dir"])
+            updated["expected_business_name"] = self.settings.get("expected_business_name", "")
+            updated["enabled_rows"] = self.settings.get("enabled_rows", {})
+            self.settings = updated
             self._save_settings()
+            self._apply_ui_font_size()
             mode = "CrUX-first" if self.settings.get("prefer_crux_first") else "PSI-first"
             self.status_label.setText(f"Settings saved ({mode}).")
 
@@ -435,6 +482,9 @@ class MainWindow(QMainWindow):
         self.save_btn.setEnabled(True)
         self.progress_non_cwv_bar.setValue(100)
         self.progress_cwv_bar.setValue(100)
+        if bool(self.settings.get("auto_save_last_run", True)):
+            self._save_current_run_to_history()
+            self.refresh_history_dropdown()
         self.status_label.setText("Complete. Results displayed below.")
 
     def _fit_qa_column(self) -> None:
@@ -490,6 +540,8 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Run failed", message)
 
     def on_social_links_ready(self, links: list, conflicts: list) -> None:
+        self.latest_social_links = links
+        self.latest_social_conflicts = conflicts
         self.social_list.clear()
         for entry in links:
             platform = entry.get("platform", "social")
@@ -508,6 +560,7 @@ class MainWindow(QMainWindow):
         self.social_toggle.setText("Social links \u25b4" if checked else "Social links \u25be")
 
     def on_pages_checked_ready(self, pages: list) -> None:
+        self.latest_pages_checked = pages
         self.pages_list.clear()
         for page in pages:
             item = QListWidgetItem(page)
@@ -519,6 +572,7 @@ class MainWindow(QMainWindow):
         self.pages_toggle.setText("Pages checked \u25b4" if checked else "Pages checked \u25be")
 
     def on_spelling_issues_ready(self, words: list) -> None:
+        self.latest_spelling_issues = words
         self.spell_list.clear()
         for word in words:
             self.spell_list.addItem(QListWidgetItem(word))
@@ -531,6 +585,75 @@ class MainWindow(QMainWindow):
 
     def on_row_details_ready(self, details: dict) -> None:
         self.row_details_map = details
+
+    def _history_dir(self) -> str:
+        d = str(self.settings.get("results_history_dir", DEFAULT_SETTINGS["results_history_dir"]))
+        if not d:
+            d = DEFAULT_SETTINGS["results_history_dir"]
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _save_current_run_to_history(self) -> None:
+        if not self.results:
+            return
+        snapshot = {
+            "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "url": self.url_input.text().strip(),
+            "results": [asdict(r) for r in self.results],
+            "row_details": self.row_details_map,
+            "social_links": self.latest_social_links,
+            "social_conflicts": self.latest_social_conflicts,
+            "pages_checked": self.latest_pages_checked,
+            "spelling_issues": self.latest_spelling_issues,
+        }
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(self._history_dir(), f"run-{stamp}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2)
+
+    def refresh_history_dropdown(self) -> None:
+        self.history_combo.clear()
+        files = []
+        d = self._history_dir()
+        for name in os.listdir(d):
+            if name.lower().endswith(".json") and name.startswith("run-"):
+                full = os.path.join(d, name)
+                try:
+                    mtime = os.path.getmtime(full)
+                    files.append((mtime, full))
+                except OSError:
+                    continue
+        files.sort(reverse=True)
+        for _mtime, full in files[:10]:
+            label = os.path.basename(full)
+            self.history_combo.addItem(label, full)
+
+    def _render_loaded_results(self) -> None:
+        self.table.setRowCount(0)
+        for r in self.results:
+            self._append_row(r)
+        self._fit_qa_column()
+        self.on_social_links_ready(self.latest_social_links, self.latest_social_conflicts)
+        self.on_pages_checked_ready(self.latest_pages_checked)
+        self.on_spelling_issues_ready(self.latest_spelling_issues)
+
+    def load_selected_history_run(self) -> None:
+        path = self.history_combo.currentData()
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                snap = json.load(f)
+            self.results = [CheckResult(**row) for row in snap.get("results", [])]
+            self.row_details_map = snap.get("row_details", {}) or {}
+            self.latest_social_links = snap.get("social_links", []) or []
+            self.latest_social_conflicts = snap.get("social_conflicts", []) or []
+            self.latest_pages_checked = snap.get("pages_checked", []) or []
+            self.latest_spelling_issues = snap.get("spelling_issues", []) or []
+            self._render_loaded_results()
+            self.status_label.setText(f"Loaded history: {os.path.basename(path)}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Load failed", str(exc))
 
     def _is_detail_row(self, row: int) -> bool:
         item = self.table.item(row, 0)
