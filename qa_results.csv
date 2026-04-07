@@ -1,0 +1,9 @@
+QA Component,Y/N,Desktop Pass/Fail,Mobile Pass/Fail,Tablet Pass/Fail,Notes
+If Inheriting an Exiting Website: Is it a passable design?,TBD,Manual,Manual,Manual,Manual visual/brand quality review required per device.
+Fast website/page load speed (Does it feel fast/snappy?),Yes,Pass,Pass,Pass,"Avg load ms across 1 page(s): desktop=220, mobile=190, tablet=194"
+Navigation bar functionality - responsive menu bar,No,Fail,Fail,Fail,Device-emulated check for nav and responsive menu hints.
+Working links & buttons,Yes,Pass,Pass,Pass,D:1 pages checked; link-check failures on 0 page(s) | M:1 pages checked; link-check failures on 0 page(s) | T:1 pages checked; link-check failures on 0 page(s)
+Phone Number Present in Head (NOT Only Book Online),No,Fail,Fail,Fail,Device-emulated header text phone regex across 1 page(s).
+Footer functionality - working links,No,Fail,Fail,Fail,D:1 pages checked; footer-check failures on 1 page(s) | M:1 pages checked; footer-check failures on 1 page(s) | T:1 pages checked; footer-check failures on 1 page(s)
+Rise Plugin Compatible (Wordpress),No,Fail,Fail,Fail,No WordPress markers found
+Core Web Vitals,No,Fail,Fail,Fail,Desktop PSI error: HTTP Error 429: Too Many Requests; Mobile/Tablet PSI error: HTTP Error 429: Too Many Requests; pages_audited=1

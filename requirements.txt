@@ -1,0 +1,2 @@
+playwright>=1.53.0
+PyQt6>=6.7.0
