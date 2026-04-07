@@ -7,7 +7,7 @@ on:
   pull_request:
 
 jobs:
-  build-windows-exe:
+  build-windows-dir:
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -26,17 +26,17 @@ jobs:
           python -m pip install -r requirements.txt pyinstaller
           python -m playwright install chromium
 
-      - name: Build one-file EXE
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: "0"
+      - name: Build onedir app
         run: |
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --name "AutoWebsiteChecker" --add-data "settings.json;." --add-data "run-history;run-history" --add-data "assets/app-icon.png;assets" "gui.py"
+          python -m PyInstaller --noconfirm --clean --windowed --name "AutoWebsiteChecker" --add-data "settings.json;." --add-data "run-history;run-history" --add-data "assets/app-icon.png;assets" "gui.py"
+          $env:PLAYWRIGHT_BROWSERS_PATH = "$pwd\dist\AutoWebsiteChecker\ms-playwright"
+          python -m playwright install chromium
 
-      - name: Upload EXE artifact
+      - name: Upload Windows portable dir artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AutoWebsiteChecker-windows-exe
-          path: dist/AutoWebsiteChecker.exe
+          name: AutoWebsiteChecker-windows-dir
+          path: dist/AutoWebsiteChecker/**
           if-no-files-found: error
 
   build-macos-dmg:
@@ -51,17 +51,15 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: "0"
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
 
       - name: Build app bundle
-        env:
-          PLAYWRIGHT_BROWSERS_PATH: "0"
         run: |
           python -m PyInstaller --noconfirm --clean --windowed --name "AutoWebsiteChecker" --add-data "settings.json:." --add-data "run-history:run-history" --add-data "assets/app-icon.png:assets" --codesign-identity "" "gui.py"
+          export PLAYWRIGHT_BROWSERS_PATH="$(pwd)/dist/AutoWebsiteChecker.app/Contents/Resources/ms-playwright"
+          python -m playwright install chromium
 
       - name: Create DMG
         run: |

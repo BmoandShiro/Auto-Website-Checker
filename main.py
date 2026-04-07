@@ -874,6 +874,7 @@ def combine_device_audits(profile_name: str, audits: List[DeviceAudit]) -> Multi
 def run_device_audits(
     urls: List[str], on_audit_complete=None
 ) -> Tuple[Dict[str, MultiPageDeviceAudit], Dict[str, List[DeviceAudit]]]:
+    configure_playwright_env_for_bundle()
     by_profile: Dict[str, List[DeviceAudit]] = {p.name: [] for p in DEVICE_PROFILES}
 
     def synthesize_browser_unavailable(reason: str) -> Tuple[Dict[str, MultiPageDeviceAudit], Dict[str, List[DeviceAudit]]]:
@@ -909,7 +910,7 @@ def run_device_audits(
         except Exception as first_exc:
             # First-run fallback: install Chromium for current user, then retry once.
             try:
-                subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, timeout=300)
+                install_playwright_chromium(timeout_s=300)
                 browser = p.chromium.launch(headless=True)
             except Exception:
                 return synthesize_browser_unavailable(str(first_exc))
@@ -937,6 +938,7 @@ def run_device_audits(
 
 
 def is_chromium_available() -> bool:
+    configure_playwright_env_for_bundle()
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -944,6 +946,44 @@ def is_chromium_available() -> bool:
         return True
     except Exception:
         return False
+
+
+def install_playwright_chromium(timeout_s: int = 600) -> None:
+    """
+    Install Playwright Chromium using bundled driver when possible.
+    Works better in frozen/packaged apps than `python -m playwright`.
+    """
+    configure_playwright_env_for_bundle()
+    try:
+        from playwright._impl._driver import compute_driver_executable  # type: ignore
+
+        driver_exe, cli_path = compute_driver_executable()
+        subprocess.run([driver_exe, cli_path, "install", "chromium"], check=True, timeout=timeout_s)
+        return
+    except Exception:
+        # Fallback for normal source environments.
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, timeout=timeout_s)
+
+
+def configure_playwright_env_for_bundle() -> None:
+    """
+    If running from a packaged app, force Playwright to use bundled browsers
+    from an app-local `ms-playwright` directory.
+    """
+    if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+        return
+    candidates: List[str] = []
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(sys.executable)
+        candidates.append(os.path.join(exe_dir, "ms-playwright"))
+        # macOS .app: executable is in Contents/MacOS, resources in Contents/Resources
+        candidates.append(os.path.abspath(os.path.join(exe_dir, "..", "Resources", "ms-playwright")))
+    else:
+        candidates.append(os.path.join(os.path.dirname(__file__), "ms-playwright"))
+    for path in candidates:
+        if os.path.isdir(path):
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = path
+            break
 
 
 def build_results(

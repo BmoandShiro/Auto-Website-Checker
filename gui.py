@@ -41,7 +41,7 @@ from PyQt6.QtWidgets import (
     QToolButton,
 )
 
-from main import QA_ROW_OPTIONS, CheckResult, build_results, is_chromium_available
+from main import QA_ROW_OPTIONS, CheckResult, build_results, install_playwright_chromium, is_chromium_available
 
 
 APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".auto_website_checker")
@@ -453,6 +453,16 @@ class MainWindow(QMainWindow):
         os.makedirs(APP_DATA_DIR, exist_ok=True)
         if not os.path.exists(SETTINGS_PATH):
             return dict(DEFAULT_SETTINGS)
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                return dict(DEFAULT_SETTINGS)
+            merged = dict(DEFAULT_SETTINGS)
+            merged.update(raw)
+            return merged
+        except Exception:
+            return dict(DEFAULT_SETTINGS)
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
@@ -477,14 +487,6 @@ class MainWindow(QMainWindow):
                     "Chromium Still Missing",
                     "Could not verify Chromium installation. Checks may fall back to Manual.",
                 )
-        try:
-            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            merged = dict(DEFAULT_SETTINGS)
-            merged.update(raw)
-            return merged
-        except Exception:
-            return dict(DEFAULT_SETTINGS)
 
     def _save_settings(self) -> None:
         os.makedirs(APP_DATA_DIR, exist_ok=True)
@@ -684,7 +686,7 @@ class MainWindow(QMainWindow):
         self.install_browser_btn.setEnabled(False)
         self.status_label.setText("Installing Chromium dependency...")
         try:
-            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, timeout=600)
+            install_playwright_chromium(timeout_s=600)
             self.status_label.setText("Chromium installed. Re-run checks to enable browser-based rows.")
             QMessageBox.information(self, "Install complete", "Chromium installed successfully.")
         except Exception as exc:
