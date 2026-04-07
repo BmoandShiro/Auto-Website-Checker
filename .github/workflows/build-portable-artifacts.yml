@@ -30,7 +30,7 @@ jobs:
         env:
           PLAYWRIGHT_BROWSERS_PATH: "0"
         run: |
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --name "AutoWebsiteChecker" --add-data "settings.json;." --add-data "run-history;run-history" "gui.py"
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name "AutoWebsiteChecker" --add-data "settings.json;." --add-data "run-history;run-history" --add-data "assets/app-icon.png;assets" "gui.py"
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
@@ -62,7 +62,7 @@ jobs:
         env:
           PLAYWRIGHT_BROWSERS_PATH: "0"
         run: |
-          python -m PyInstaller --noconfirm --clean --windowed --name "AutoWebsiteChecker" --add-data "settings.json:." --add-data "run-history:run-history" "gui.py"
+          python -m PyInstaller --noconfirm --clean --windowed --name "AutoWebsiteChecker" --add-data "settings.json:." --add-data "run-history:run-history" --add-data "assets/app-icon.png:assets" "gui.py"
 
       - name: Create DMG
         run: |

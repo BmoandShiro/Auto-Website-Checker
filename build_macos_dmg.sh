@@ -15,6 +15,7 @@ python3 -m PyInstaller \
   --name "AutoWebsiteChecker" \
   --add-data "settings.json:." \
   --add-data "run-history:run-history" \
+  --add-data "assets/app-icon.png:assets" \
   "gui.py"
 
 echo "Create DMG (requires macOS + hdiutil)..."

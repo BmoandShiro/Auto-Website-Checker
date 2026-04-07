@@ -17,6 +17,7 @@ py -3 -m PyInstaller ^
   --name "AutoWebsiteChecker" ^
   --add-data "settings.json;." ^
   --add-data "run-history;run-history" ^
+  --add-data "assets\\app-icon.png;assets" ^
   "gui.py"
 
 if exist "dist\AutoWebsiteChecker.exe" (

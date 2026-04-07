@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import csv
 import datetime
 import json
 import os
@@ -13,14 +12,13 @@ from dataclasses import asdict
 from typing import List
 
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFontMetrics
+from PyQt6.QtGui import QColor, QFontMetrics, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QHeaderView,
     QHBoxLayout,
@@ -32,6 +30,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QSpinBox,
     QComboBox,
     QTableWidget,
     QTableWidgetItem,
@@ -70,34 +69,37 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
-        self.timeout = self._make_chevron_number(
-            initial=float(current["timeout_seconds"]), minimum=5, maximum=120, step=1, decimals=0
-        )
+        self.timeout = QSpinBox()
+        self.timeout.setRange(5, 120)
+        self.timeout.setValue(int(current["timeout_seconds"]))
         form.addRow("Timeout (seconds)", self.timeout)
 
-        self.max_links = self._make_chevron_number(
-            initial=float(current["max_links_per_check"]), minimum=1, maximum=200, step=1, decimals=0
-        )
+        self.max_links = QSpinBox()
+        self.max_links.setRange(1, 200)
+        self.max_links.setValue(int(current["max_links_per_check"]))
         form.addRow("Max links per check", self.max_links)
 
-        self.fast_threshold = self._make_chevron_number(
-            initial=float(current["fast_load_ms_threshold"]), minimum=500, maximum=15000, step=100, decimals=0
-        )
+        self.fast_threshold = QSpinBox()
+        self.fast_threshold.setRange(500, 15000)
+        self.fast_threshold.setSingleStep(100)
+        self.fast_threshold.setValue(int(current["fast_load_ms_threshold"]))
         form.addRow("Fast threshold (ms)", self.fast_threshold)
 
-        self.max_pages = self._make_chevron_number(
-            initial=float(current["max_pages_to_audit"]), minimum=1, maximum=25, step=1, decimals=0
-        )
+        self.max_pages = QSpinBox()
+        self.max_pages.setRange(1, 25)
+        self.max_pages.setValue(int(current["max_pages_to_audit"]))
         form.addRow("Max pages to audit", self.max_pages)
 
-        self.psi_cooldown = self._make_chevron_number(
-            initial=float(current["psi_cooldown_seconds"]), minimum=0.0, maximum=60.0, step=0.5, decimals=1
-        )
+        self.psi_cooldown = QDoubleSpinBox()
+        self.psi_cooldown.setRange(0.0, 60.0)
+        self.psi_cooldown.setSingleStep(0.5)
+        self.psi_cooldown.setValue(float(current["psi_cooldown_seconds"]))
         form.addRow("PSI cooldown (seconds)", self.psi_cooldown)
 
-        self.throttle = self._make_chevron_number(
-            initial=float(current["request_throttle_seconds"]), minimum=0.0, maximum=5.0, step=0.1, decimals=1
-        )
+        self.throttle = QDoubleSpinBox()
+        self.throttle.setRange(0.0, 5.0)
+        self.throttle.setSingleStep(0.1)
+        self.throttle.setValue(float(current["request_throttle_seconds"]))
         form.addRow("HTTP throttle (seconds)", self.throttle)
 
         self.prefer_crux = QCheckBox("Prefer CrUX first for CWV")
@@ -108,13 +110,15 @@ class SettingsDialog(QDialog):
         self.enable_cwv.setChecked(bool(current.get("enable_core_web_vitals", False)))
         form.addRow(self.enable_cwv)
 
-        self.ui_font_size = self._make_chevron_number(
-            initial=float(current.get("ui_font_size", 10)), minimum=8, maximum=20, step=1, decimals=0
-        )
+        self.ui_font_size = QSpinBox()
+        self.ui_font_size.setRange(8, 20)
+        self.ui_font_size.setValue(int(current.get("ui_font_size", 10)))
         form.addRow("UI font size", self.ui_font_size)
 
         self.ui_theme = QComboBox()
-        self.ui_theme.addItems(["Dark Gray", "Dark Blue", "Dark Purple", "Light"])
+        self.ui_theme.addItems(
+            ["Dark Gray", "Dark Gray + Blue Accent", "Dark Gray + Orange Accent", "Dark Blue", "Dark Purple", "Light"]
+        )
         current_theme = str(current.get("ui_theme", "Dark Gray"))
         idx = self.ui_theme.findText(current_theme)
         self.ui_theme.setCurrentIndex(idx if idx >= 0 else 0)
@@ -132,61 +136,18 @@ class SettingsDialog(QDialog):
 
     def to_settings(self) -> dict:
         return {
-            "timeout_seconds": int(self._chevron_value(self.timeout)),
-            "max_links_per_check": int(self._chevron_value(self.max_links)),
-            "fast_load_ms_threshold": int(self._chevron_value(self.fast_threshold)),
-            "max_pages_to_audit": int(self._chevron_value(self.max_pages)),
-            "psi_cooldown_seconds": float(self._chevron_value(self.psi_cooldown)),
-            "request_throttle_seconds": float(self._chevron_value(self.throttle)),
+            "timeout_seconds": int(self.timeout.value()),
+            "max_links_per_check": int(self.max_links.value()),
+            "fast_load_ms_threshold": int(self.fast_threshold.value()),
+            "max_pages_to_audit": int(self.max_pages.value()),
+            "psi_cooldown_seconds": float(self.psi_cooldown.value()),
+            "request_throttle_seconds": float(self.throttle.value()),
             "prefer_crux_first": bool(self.prefer_crux.isChecked()),
             "enable_core_web_vitals": bool(self.enable_cwv.isChecked()),
-            "ui_font_size": int(self._chevron_value(self.ui_font_size)),
+            "ui_font_size": int(self.ui_font_size.value()),
             "ui_theme": self.ui_theme.currentText(),
             "auto_save_last_run": bool(self.auto_save_last_run.isChecked()),
         }
-
-    def _make_chevron_number(self, initial: float, minimum: float, maximum: float, step: float, decimals: int) -> QWidget:
-        container = QWidget()
-        row = QHBoxLayout(container)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
-        down = QToolButton()
-        down.setText("˅")
-        value_label = QLabel()
-        value_label.setMinimumWidth(60)
-        value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        up = QToolButton()
-        up.setText("˄")
-
-        state = {"value": max(minimum, min(maximum, initial))}
-
-        def render() -> None:
-            if decimals == 0:
-                value_label.setText(str(int(round(state["value"]))))
-            else:
-                value_label.setText(f"{state['value']:.{decimals}f}")
-
-        def dec() -> None:
-            state["value"] = max(minimum, state["value"] - step)
-            render()
-
-        def inc() -> None:
-            state["value"] = min(maximum, state["value"] + step)
-            render()
-
-        down.clicked.connect(dec)
-        up.clicked.connect(inc)
-        render()
-
-        row.addWidget(down)
-        row.addWidget(value_label)
-        row.addWidget(up)
-
-        container._value_state = state  # type: ignore[attr-defined]
-        return container
-
-    def _chevron_value(self, control: QWidget) -> float:
-        return float(control._value_state["value"])  # type: ignore[attr-defined]
 
 
 class RowConfigDialog(QDialog):
@@ -297,11 +258,6 @@ class MainWindow(QMainWindow):
         self.run_btn = QPushButton("Run Check")
         self.run_btn.clicked.connect(self.run_audit)
         url_row.addWidget(self.run_btn)
-
-        self.save_btn = QPushButton("Save CSV")
-        self.save_btn.setEnabled(False)
-        self.save_btn.clicked.connect(self.save_csv)
-        url_row.addWidget(self.save_btn)
 
         self.settings_btn = QPushButton("Settings")
         self.settings_btn.clicked.connect(self.open_settings)
@@ -454,7 +410,6 @@ class MainWindow(QMainWindow):
             return
 
         self.run_btn.setEnabled(False)
-        self.save_btn.setEnabled(False)
         self.results = []
         self.row_details_map = {}
         self.table.setRowCount(0)
@@ -549,6 +504,32 @@ class MainWindow(QMainWindow):
                 "QProgressBar { border:1px solid #d1d5db; border-radius:8px; background:#ffffff; color:#334155; text-align:center; }"
                 "QProgressBar::chunk { background:#2563eb; border-radius:8px; }"
             )
+        elif theme == "Dark Gray + Blue Accent":
+            self.setStyleSheet(
+                "QWidget { background:#18181b; color:#e4e4e7; }"
+                "QLabel { color:#d4d4d8; }"
+                "QLineEdit,QTextEdit,QListWidget,QTableWidget,QComboBox { background:#27272a; color:#f4f4f5; border:1px solid #3f3f46; border-radius:8px; padding:4px; selection-background-color:#2563eb; selection-color:#ffffff; }"
+                "QLineEdit:focus,QTextEdit:focus,QListWidget:focus,QTableWidget:focus,QComboBox:focus { border:1px solid #3f3f46; }"
+                "QPushButton,QToolButton { background:#27272a; color:#f4f4f5; border:1px solid #52525b; border-radius:10px; padding:6px 10px; }"
+                "QPushButton:hover,QToolButton:hover { background:#1d4ed8; }"
+                "QPushButton:pressed,QToolButton:pressed,QPushButton:checked,QToolButton:checked { background:#3b82f6; color:#ffffff; border:1px solid #52525b; }"
+                "QHeaderView::section { background:#27272a; color:#f4f4f5; border:0; padding:6px; }"
+                "QProgressBar { border:1px solid #3f3f46; border-radius:8px; background:#27272a; color:#f4f4f5; text-align:center; }"
+                "QProgressBar::chunk { background:#3b82f6; border-radius:8px; }"
+            )
+        elif theme == "Dark Gray + Orange Accent":
+            self.setStyleSheet(
+                "QWidget { background:#18181b; color:#e4e4e7; }"
+                "QLabel { color:#d4d4d8; }"
+                "QLineEdit,QTextEdit,QListWidget,QTableWidget,QComboBox { background:#27272a; color:#f4f4f5; border:1px solid #3f3f46; border-radius:8px; padding:4px; selection-background-color:#ea580c; selection-color:#ffffff; }"
+                "QLineEdit:focus,QTextEdit:focus,QListWidget:focus,QTableWidget:focus,QComboBox:focus { border:1px solid #3f3f46; }"
+                "QPushButton,QToolButton { background:#27272a; color:#f4f4f5; border:1px solid #52525b; border-radius:10px; padding:6px 10px; }"
+                "QPushButton:hover,QToolButton:hover { background:#9a3412; }"
+                "QPushButton:pressed,QToolButton:pressed,QPushButton:checked,QToolButton:checked { background:#f97316; color:#111111; border:1px solid #52525b; }"
+                "QHeaderView::section { background:#27272a; color:#f4f4f5; border:0; padding:6px; }"
+                "QProgressBar { border:1px solid #3f3f46; border-radius:8px; background:#27272a; color:#f4f4f5; text-align:center; }"
+                "QProgressBar::chunk { background:#f97316; border-radius:8px; }"
+            )
         else:
             self.setStyleSheet(
                 "QWidget { background:#18181b; color:#e4e4e7; }"
@@ -588,7 +569,6 @@ class MainWindow(QMainWindow):
         self.results = results
         self._fit_qa_column()
         self.run_btn.setEnabled(True)
-        self.save_btn.setEnabled(True)
         self.progress_non_cwv_bar.setValue(100)
         self.progress_cwv_bar.setValue(100)
         if bool(self.settings.get("auto_save_last_run", True)):
@@ -642,7 +622,6 @@ class MainWindow(QMainWindow):
 
     def on_error(self, message: str) -> None:
         self.run_btn.setEnabled(True)
-        self.save_btn.setEnabled(False)
         self.progress_non_cwv_bar.setValue(0)
         self.progress_cwv_bar.setValue(0)
         self.status_label.setText("Check failed.")
@@ -827,23 +806,20 @@ class MainWindow(QMainWindow):
         if url:
             webbrowser.open(url)
 
-    def save_csv(self) -> None:
-        if not self.results:
-            return
-        path, _ = QFileDialog.getSaveFileName(self, "Save Results", "qa_results.csv", "CSV Files (*.csv)")
-        if not path:
-            return
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["QA Component", "Y/N", "Desktop Pass/Fail", "Mobile Pass/Fail", "Tablet Pass/Fail", "Notes"])
-            for r in self.results:
-                writer.writerow([r.component, r.yes_no, r.desktop, r.mobile, r.tablet, r.notes])
-        self.status_label.setText(f"Saved CSV to: {path}")
-
-
 def main() -> int:
     app = QApplication(sys.argv)
+    # Ensure icon works both in source runs and PyInstaller bundles.
+    if getattr(sys, "frozen", False):
+        base_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base_dir = os.path.dirname(__file__)
+    icon_path = os.path.join(base_dir, "assets", "app-icon.png")
+    if os.path.exists(icon_path):
+        icon = QIcon(icon_path)
+        app.setWindowIcon(icon)
     window = MainWindow()
+    if os.path.exists(icon_path):
+        window.setWindowIcon(QIcon(icon_path))
     window.show()
     return app.exec()
 
