@@ -41,7 +41,7 @@ from PyQt6.QtWidgets import (
     QToolButton,
 )
 
-from main import QA_ROW_OPTIONS, CheckResult, build_results
+from main import QA_ROW_OPTIONS, CheckResult, build_results, is_chromium_available
 
 
 APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".auto_website_checker")
@@ -393,6 +393,7 @@ class MainWindow(QMainWindow):
         self._apply_ui_font_size()
         self._apply_theme()
         self.refresh_history_dropdown()
+        self._startup_browser_prompted = False
 
     @staticmethod
     def _style_result_cell(item: QTableWidgetItem, value: str) -> None:
@@ -413,6 +414,10 @@ class MainWindow(QMainWindow):
         if not url.startswith(("http://", "https://")):
             url = f"https://{url}"
             self.url_input.setText(url)
+
+        # Preflight: if browser-dependent rows are enabled and Chromium is missing,
+        # prompt to install first (before running checks).
+        self._prompt_install_chromium_if_needed("Chromium Required")
 
         self.run_btn.setEnabled(False)
         self.results = []
@@ -448,6 +453,30 @@ class MainWindow(QMainWindow):
         os.makedirs(APP_DATA_DIR, exist_ok=True)
         if not os.path.exists(SETTINGS_PATH):
             return dict(DEFAULT_SETTINGS)
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        if not self._startup_browser_prompted:
+            self._startup_browser_prompted = True
+            self._prompt_install_chromium_if_needed("Install Browser Dependency")
+
+    def _prompt_install_chromium_if_needed(self, title: str) -> None:
+        if is_chromium_available():
+            return
+        choice = QMessageBox.question(
+            self,
+            title,
+            "Chromium is missing and browser-based checks are enabled.\n\nInstall Chromium now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            self.install_browser_dependency()
+            if not is_chromium_available():
+                QMessageBox.warning(
+                    self,
+                    "Chromium Still Missing",
+                    "Could not verify Chromium installation. Checks may fall back to Manual.",
+                )
         try:
             with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
                 raw = json.load(f)

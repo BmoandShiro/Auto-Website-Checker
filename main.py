@@ -936,6 +936,16 @@ def run_device_audits(
     return merged, by_profile
 
 
+def is_chromium_available() -> bool:
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+        return True
+    except Exception:
+        return False
+
+
 def build_results(
     url: str,
     max_pages: int = MAX_PAGES_TO_AUDIT,
