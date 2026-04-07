@@ -405,9 +405,13 @@ class MainWindow(QMainWindow):
 
     def run_audit(self) -> None:
         url = self.url_input.text().strip()
-        if not url.startswith(("http://", "https://")):
-            QMessageBox.warning(self, "Invalid URL", "URL must start with http:// or https://")
+        if not url:
+            QMessageBox.warning(self, "Invalid URL", "Please enter a website URL.")
             return
+        # Friendly first-run behavior: accept bare domains and normalize.
+        if not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
+            self.url_input.setText(url)
 
         self.run_btn.setEnabled(False)
         self.results = []
