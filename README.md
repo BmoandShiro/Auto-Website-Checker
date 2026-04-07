@@ -51,6 +51,19 @@ GUI features:
 - View results in a table (Desktop/Mobile/Tablet columns)
 - Save displayed results to CSV
 
+## Windows helper scripts
+
+- Run GUI:
+  - `run_gui.bat`
+- Build portable one-file EXE:
+  - `build_portable_onefile.bat`
+  - Output: `dist/AutoWebsiteChecker.exe`
+
+## macOS DMG build
+
+- Use `build_macos_dmg.sh` on a Mac (cannot build DMG on Windows)
+- Output: `dist/AutoWebsiteChecker.dmg`
+
 ## Output
 
 Creates a CSV with columns:
