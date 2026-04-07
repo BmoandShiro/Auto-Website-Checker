@@ -40,7 +40,7 @@ jobs:
           if-no-files-found: error
 
   build-macos-dmg:
-    runs-on: macos-latest
+    runs-on: macos-13
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,7 +62,7 @@ jobs:
         env:
           PLAYWRIGHT_BROWSERS_PATH: "0"
         run: |
-          python -m PyInstaller --noconfirm --clean --windowed --name "AutoWebsiteChecker" --add-data "settings.json:." --add-data "run-history:run-history" --add-data "assets/app-icon.png:assets" "gui.py"
+          python -m PyInstaller --noconfirm --clean --windowed --name "AutoWebsiteChecker" --add-data "settings.json:." --add-data "run-history:run-history" --add-data "assets/app-icon.png:assets" --codesign-identity "" "gui.py"
 
       - name: Create DMG
         run: |
