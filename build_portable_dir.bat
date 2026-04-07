@@ -11,6 +11,7 @@ py -3 -m PyInstaller ^
   --clean ^
   --windowed ^
   --name "AutoWebsiteChecker" ^
+  --collect-data "spellchecker" ^
   --add-data "settings.json;." ^
   --add-data "run-history;run-history" ^
   --add-data "assets\\app-icon.png;assets" ^

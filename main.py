@@ -567,7 +567,10 @@ def check_spelling_grammar(pages_html: List[str]) -> Tuple[bool, str, List[str]]
     except Exception:
         return False, "Spell checker package unavailable (install pyspellchecker)", []
 
-    spell = SpellChecker()
+    try:
+        spell = SpellChecker()
+    except Exception as exc:
+        return False, f"Spell checker dictionary unavailable: {exc}", []
     # limit sample for speed on very large pages
     subset = [w.lower() for w in words[:3000]]
     unknown = spell.unknown(subset)

@@ -7,7 +7,7 @@ on:
   pull_request:
 
 jobs:
-  build-windows-dir:
+  build-windows:
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -28,7 +28,7 @@ jobs:
 
       - name: Build onedir app
         run: |
-          python -m PyInstaller --noconfirm --clean --windowed --name "AutoWebsiteChecker" --add-data "settings.json;." --add-data "run-history;run-history" --add-data "assets/app-icon.png;assets" "gui.py"
+          python -m PyInstaller --noconfirm --clean --windowed --name "AutoWebsiteChecker" --collect-data "spellchecker" --add-data "settings.json;." --add-data "run-history;run-history" --add-data "assets/app-icon.png;assets" "gui.py"
           $env:PLAYWRIGHT_BROWSERS_PATH = "$pwd\dist\AutoWebsiteChecker\ms-playwright"
           python -m playwright install chromium
 
@@ -37,6 +37,17 @@ jobs:
         with:
           name: AutoWebsiteChecker-windows-dir
           path: dist/AutoWebsiteChecker/**
+          if-no-files-found: error
+
+      - name: Build onefile EXE
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name "AutoWebsiteChecker" --collect-data "spellchecker" --add-data "settings.json;." --add-data "run-history;run-history" --add-data "assets/app-icon.png;assets" "gui.py"
+
+      - name: Upload Windows onefile artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoWebsiteChecker-windows-exe
+          path: dist/AutoWebsiteChecker.exe
           if-no-files-found: error
 
   build-macos-dmg:
@@ -57,7 +68,7 @@ jobs:
 
       - name: Build app bundle
         run: |
-          python -m PyInstaller --noconfirm --clean --windowed --name "AutoWebsiteChecker" --add-data "settings.json:." --add-data "run-history:run-history" --add-data "assets/app-icon.png:assets" --codesign-identity "" "gui.py"
+          python -m PyInstaller --noconfirm --clean --windowed --name "AutoWebsiteChecker" --collect-data "spellchecker" --add-data "settings.json:." --add-data "run-history:run-history" --add-data "assets/app-icon.png:assets" --codesign-identity "" "gui.py"
           export PLAYWRIGHT_BROWSERS_PATH="$(pwd)/dist/AutoWebsiteChecker.app/Contents/Resources/ms-playwright"
           python -m playwright install chromium
 
