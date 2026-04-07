@@ -32,7 +32,6 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
-    QSpinBox,
     QComboBox,
     QTableWidget,
     QTableWidgetItem,
@@ -60,6 +59,7 @@ DEFAULT_SETTINGS = {
     "ui_font_size": 10,
     "auto_save_last_run": True,
     "results_history_dir": os.path.join(APP_DATA_DIR, "run-history"),
+    "ui_theme": "Dark Gray",
 }
 
 
@@ -70,36 +70,34 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
-        self.timeout = QSpinBox()
-        self.timeout.setRange(5, 120)
-        self.timeout.setValue(int(current["timeout_seconds"]))
+        self.timeout = self._make_chevron_number(
+            initial=float(current["timeout_seconds"]), minimum=5, maximum=120, step=1, decimals=0
+        )
         form.addRow("Timeout (seconds)", self.timeout)
 
-        self.max_links = QSpinBox()
-        self.max_links.setRange(1, 200)
-        self.max_links.setValue(int(current["max_links_per_check"]))
+        self.max_links = self._make_chevron_number(
+            initial=float(current["max_links_per_check"]), minimum=1, maximum=200, step=1, decimals=0
+        )
         form.addRow("Max links per check", self.max_links)
 
-        self.fast_threshold = QSpinBox()
-        self.fast_threshold.setRange(500, 15000)
-        self.fast_threshold.setValue(int(current["fast_load_ms_threshold"]))
+        self.fast_threshold = self._make_chevron_number(
+            initial=float(current["fast_load_ms_threshold"]), minimum=500, maximum=15000, step=100, decimals=0
+        )
         form.addRow("Fast threshold (ms)", self.fast_threshold)
 
-        self.max_pages = QSpinBox()
-        self.max_pages.setRange(1, 25)
-        self.max_pages.setValue(int(current["max_pages_to_audit"]))
+        self.max_pages = self._make_chevron_number(
+            initial=float(current["max_pages_to_audit"]), minimum=1, maximum=25, step=1, decimals=0
+        )
         form.addRow("Max pages to audit", self.max_pages)
 
-        self.psi_cooldown = QDoubleSpinBox()
-        self.psi_cooldown.setRange(0.0, 60.0)
-        self.psi_cooldown.setSingleStep(0.5)
-        self.psi_cooldown.setValue(float(current["psi_cooldown_seconds"]))
+        self.psi_cooldown = self._make_chevron_number(
+            initial=float(current["psi_cooldown_seconds"]), minimum=0.0, maximum=60.0, step=0.5, decimals=1
+        )
         form.addRow("PSI cooldown (seconds)", self.psi_cooldown)
 
-        self.throttle = QDoubleSpinBox()
-        self.throttle.setRange(0.0, 5.0)
-        self.throttle.setSingleStep(0.1)
-        self.throttle.setValue(float(current["request_throttle_seconds"]))
+        self.throttle = self._make_chevron_number(
+            initial=float(current["request_throttle_seconds"]), minimum=0.0, maximum=5.0, step=0.1, decimals=1
+        )
         form.addRow("HTTP throttle (seconds)", self.throttle)
 
         self.prefer_crux = QCheckBox("Prefer CrUX first for CWV")
@@ -110,10 +108,17 @@ class SettingsDialog(QDialog):
         self.enable_cwv.setChecked(bool(current.get("enable_core_web_vitals", False)))
         form.addRow(self.enable_cwv)
 
-        self.ui_font_size = QSpinBox()
-        self.ui_font_size.setRange(8, 20)
-        self.ui_font_size.setValue(int(current.get("ui_font_size", 10)))
+        self.ui_font_size = self._make_chevron_number(
+            initial=float(current.get("ui_font_size", 10)), minimum=8, maximum=20, step=1, decimals=0
+        )
         form.addRow("UI font size", self.ui_font_size)
+
+        self.ui_theme = QComboBox()
+        self.ui_theme.addItems(["Dark Gray", "Dark Blue", "Dark Purple", "Light"])
+        current_theme = str(current.get("ui_theme", "Dark Gray"))
+        idx = self.ui_theme.findText(current_theme)
+        self.ui_theme.setCurrentIndex(idx if idx >= 0 else 0)
+        form.addRow("Theme", self.ui_theme)
 
         self.auto_save_last_run = QCheckBox("Auto-save run results to history")
         self.auto_save_last_run.setChecked(bool(current.get("auto_save_last_run", True)))
@@ -127,17 +132,61 @@ class SettingsDialog(QDialog):
 
     def to_settings(self) -> dict:
         return {
-            "timeout_seconds": int(self.timeout.value()),
-            "max_links_per_check": int(self.max_links.value()),
-            "fast_load_ms_threshold": int(self.fast_threshold.value()),
-            "max_pages_to_audit": int(self.max_pages.value()),
-            "psi_cooldown_seconds": float(self.psi_cooldown.value()),
-            "request_throttle_seconds": float(self.throttle.value()),
+            "timeout_seconds": int(self._chevron_value(self.timeout)),
+            "max_links_per_check": int(self._chevron_value(self.max_links)),
+            "fast_load_ms_threshold": int(self._chevron_value(self.fast_threshold)),
+            "max_pages_to_audit": int(self._chevron_value(self.max_pages)),
+            "psi_cooldown_seconds": float(self._chevron_value(self.psi_cooldown)),
+            "request_throttle_seconds": float(self._chevron_value(self.throttle)),
             "prefer_crux_first": bool(self.prefer_crux.isChecked()),
             "enable_core_web_vitals": bool(self.enable_cwv.isChecked()),
-            "ui_font_size": int(self.ui_font_size.value()),
+            "ui_font_size": int(self._chevron_value(self.ui_font_size)),
+            "ui_theme": self.ui_theme.currentText(),
             "auto_save_last_run": bool(self.auto_save_last_run.isChecked()),
         }
+
+    def _make_chevron_number(self, initial: float, minimum: float, maximum: float, step: float, decimals: int) -> QWidget:
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        down = QToolButton()
+        down.setText("˅")
+        value_label = QLabel()
+        value_label.setMinimumWidth(60)
+        value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        up = QToolButton()
+        up.setText("˄")
+
+        state = {"value": max(minimum, min(maximum, initial))}
+
+        def render() -> None:
+            if decimals == 0:
+                value_label.setText(str(int(round(state["value"]))))
+            else:
+                value_label.setText(f"{state['value']:.{decimals}f}")
+
+        def dec() -> None:
+            state["value"] = max(minimum, state["value"] - step)
+            render()
+
+        def inc() -> None:
+            state["value"] = min(maximum, state["value"] + step)
+            render()
+
+        down.clicked.connect(dec)
+        up.clicked.connect(inc)
+        render()
+
+        row.addWidget(down)
+        row.addWidget(value_label)
+        row.addWidget(up)
+
+        container._value_state = state  # type: ignore[attr-defined]
+        return container
+
+    def _chevron_value(self, control: QWidget) -> float:
+        return float(control._value_state["value"])  # type: ignore[attr-defined]
 
 
 class RowConfigDialog(QDialog):
@@ -385,6 +434,7 @@ class MainWindow(QMainWindow):
         footer_row.addWidget(self.version_label)
         layout.addLayout(footer_row)
         self._apply_ui_font_size()
+        self._apply_theme()
         self.refresh_history_dropdown()
 
     @staticmethod
@@ -458,6 +508,61 @@ class MainWindow(QMainWindow):
         font.setPointSize(size)
         self.setFont(font)
 
+    def _apply_theme(self) -> None:
+        theme = str(self.settings.get("ui_theme", "Dark Gray"))
+        if theme == "Dark Blue":
+            self.setStyleSheet(
+                "QWidget { background:#0f172a; color:#e2e8f0; }"
+                "QLabel { color:#cbd5e1; }"
+                "QLineEdit,QTextEdit,QListWidget,QTableWidget,QComboBox { background:#111827; color:#e5e7eb; border:1px solid #334155; border-radius:8px; padding:4px; }"
+                "QLineEdit:focus,QTextEdit:focus,QListWidget:focus,QTableWidget:focus,QComboBox:focus { border:1px solid #60a5fa; }"
+                "QPushButton,QToolButton { background:#1d4ed8; color:#f8fafc; border:1px solid #3b82f6; border-radius:10px; padding:6px 10px; }"
+                "QPushButton:hover,QToolButton:hover { background:#2563eb; }"
+                "QPushButton:pressed,QToolButton:pressed,QPushButton:checked,QToolButton:checked { background:#60a5fa; color:#0f172a; }"
+                "QHeaderView::section { background:#111827; color:#e5e7eb; border:0; padding:6px; }"
+                "QProgressBar { border:1px solid #334155; border-radius:8px; background:#111827; color:#e2e8f0; text-align:center; }"
+                "QProgressBar::chunk { background:#3b82f6; border-radius:8px; }"
+            )
+        elif theme == "Dark Purple":
+            self.setStyleSheet(
+                "QWidget { background:#140b24; color:#f5e9ff; }"
+                "QLabel { color:#e9d5ff; }"
+                "QLineEdit,QTextEdit,QListWidget,QTableWidget,QComboBox { background:#1f1233; color:#f8f0ff; border:1px solid #6b21a8; border-radius:8px; padding:4px; }"
+                "QLineEdit:focus,QTextEdit:focus,QListWidget:focus,QTableWidget:focus,QComboBox:focus { border:1px solid #c084fc; }"
+                "QPushButton,QToolButton { background:#6d28d9; color:#fdf4ff; border:1px solid #a855f7; border-radius:10px; padding:6px 10px; }"
+                "QPushButton:hover,QToolButton:hover { background:#7c3aed; }"
+                "QPushButton:pressed,QToolButton:pressed,QPushButton:checked,QToolButton:checked { background:#c084fc; color:#1f1233; }"
+                "QHeaderView::section { background:#1f1233; color:#f8f0ff; border:0; padding:6px; }"
+                "QProgressBar { border:1px solid #6b21a8; border-radius:8px; background:#1f1233; color:#f5e9ff; text-align:center; }"
+                "QProgressBar::chunk { background:#a855f7; border-radius:8px; }"
+            )
+        elif theme == "Light":
+            self.setStyleSheet(
+                "QWidget { background:#f8fafc; color:#0f172a; }"
+                "QLabel { color:#334155; }"
+                "QLineEdit,QTextEdit,QListWidget,QTableWidget,QComboBox { background:#ffffff; color:#0f172a; border:1px solid #d1d5db; border-radius:8px; padding:4px; }"
+                "QLineEdit:focus,QTextEdit:focus,QListWidget:focus,QTableWidget:focus,QComboBox:focus { border:1px solid #2563eb; }"
+                "QPushButton,QToolButton { background:#ffffff; color:#1e293b; border:1px solid #cbd5e1; border-radius:10px; padding:6px 10px; }"
+                "QPushButton:hover,QToolButton:hover { background:#f1f5f9; }"
+                "QPushButton:pressed,QToolButton:pressed,QPushButton:checked,QToolButton:checked { background:#2563eb; color:#ffffff; border:1px solid #2563eb; }"
+                "QHeaderView::section { background:#f1f5f9; color:#334155; border:0; padding:6px; }"
+                "QProgressBar { border:1px solid #d1d5db; border-radius:8px; background:#ffffff; color:#334155; text-align:center; }"
+                "QProgressBar::chunk { background:#2563eb; border-radius:8px; }"
+            )
+        else:
+            self.setStyleSheet(
+                "QWidget { background:#18181b; color:#e4e4e7; }"
+                "QLabel { color:#d4d4d8; }"
+                "QLineEdit,QTextEdit,QListWidget,QTableWidget,QComboBox { background:#27272a; color:#f4f4f5; border:1px solid #3f3f46; border-radius:8px; padding:4px; selection-background-color:#52525b; selection-color:#fafafa; }"
+                "QLineEdit:focus,QTextEdit:focus,QListWidget:focus,QTableWidget:focus,QComboBox:focus { border:1px solid #71717a; }"
+                "QPushButton,QToolButton { background:#27272a; color:#f4f4f5; border:1px solid #52525b; border-radius:10px; padding:6px 10px; }"
+                "QPushButton:hover,QToolButton:hover { background:#3f3f46; }"
+                "QPushButton:pressed,QToolButton:pressed,QPushButton:checked,QToolButton:checked { background:#52525b; color:#ffffff; border:1px solid #71717a; }"
+                "QHeaderView::section { background:#27272a; color:#f4f4f5; border:0; padding:6px; }"
+                "QProgressBar { border:1px solid #3f3f46; border-radius:8px; background:#27272a; color:#f4f4f5; text-align:center; }"
+                "QProgressBar::chunk { background:#71717a; border-radius:8px; }"
+            )
+
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -468,6 +573,7 @@ class MainWindow(QMainWindow):
             self.settings = updated
             self._save_settings()
             self._apply_ui_font_size()
+            self._apply_theme()
             mode = "CrUX-first" if self.settings.get("prefer_crux_first") else "PSI-first"
             self.status_label.setText(f"Settings saved ({mode}).")
 

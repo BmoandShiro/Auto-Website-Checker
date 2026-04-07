@@ -4,6 +4,9 @@ cd /d "%~dp0"
 
 echo Installing build dependencies...
 py -3 -m pip install -r requirements.txt pyinstaller
+set PLAYWRIGHT_BROWSERS_PATH=0
+echo Installing Playwright Chromium into local package...
+py -3 -m playwright install chromium
 
 echo Building one-file portable EXE...
 py -3 -m PyInstaller ^

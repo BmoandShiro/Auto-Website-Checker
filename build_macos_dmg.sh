@@ -4,6 +4,8 @@ cd "$(dirname "$0")"
 
 echo "Install dependencies..."
 python3 -m pip install -r requirements.txt pyinstaller
+export PLAYWRIGHT_BROWSERS_PATH=0
+python3 -m playwright install chromium
 
 echo "Build macOS app bundle..."
 python3 -m PyInstaller \
