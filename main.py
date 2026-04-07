@@ -876,7 +876,15 @@ def run_device_audits(
 ) -> Tuple[Dict[str, MultiPageDeviceAudit], Dict[str, List[DeviceAudit]]]:
     by_profile: Dict[str, List[DeviceAudit]] = {p.name: [] for p in DEVICE_PROFILES}
     with sync_playwright() as p:
-        browser: Browser = p.chromium.launch(headless=True)
+        try:
+            browser: Browser = p.chromium.launch(headless=True)
+        except Exception as first_exc:
+            # First-run fallback: install Chromium for current user, then retry once.
+            try:
+                subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, timeout=300)
+                browser = p.chromium.launch(headless=True)
+            except Exception:
+                raise first_exc
         try:
             for profile in DEVICE_PROFILES:
                 context = browser.new_context(
