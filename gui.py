@@ -6,11 +6,13 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import webbrowser
 from dataclasses import asdict
-from typing import List
+from urllib.parse import urlparse
+from typing import Any, List
 
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFontMetrics, QIcon
@@ -20,6 +22,7 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QHeaderView,
     QHBoxLayout,
@@ -38,6 +41,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QSizePolicy,
+    QScrollArea,
+    QTextEdit,
     QToolButton,
 )
 
@@ -46,20 +51,21 @@ from main import QA_ROW_OPTIONS, CheckResult, build_results, install_playwright_
 
 APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".auto_website_checker")
 SETTINGS_PATH = os.path.join(APP_DATA_DIR, "settings.json")
+CUSTOM_SPELL_DICT_PATH = os.path.join(APP_DATA_DIR, "custom_spell_words.txt")
 DEFAULT_SETTINGS = {
     "timeout_seconds": 30,
     "max_links_per_check": 30,
     "fast_load_ms_threshold": 2500,
     "max_pages_to_audit": 5,
-    "psi_cooldown_seconds": 3.0,
     "request_throttle_seconds": 0.5,
-    "prefer_crux_first": True,
-    "enable_core_web_vitals": False,
+    "parallel_checks": True,
+    "parallel_max_workers": 12,
+    "custom_spell_dictionary_path": CUSTOM_SPELL_DICT_PATH,
     "expected_business_name": "",
     "ui_font_size": 10,
     "auto_save_last_run": True,
     "results_history_dir": os.path.join(APP_DATA_DIR, "run-history"),
-    "ui_theme": "Dark Gray",
+    "ui_theme": "Dark Gray + Blue Accent",
 }
 
 
@@ -91,25 +97,22 @@ class SettingsDialog(QDialog):
         self.max_pages.setValue(int(current["max_pages_to_audit"]))
         form.addRow("Max pages to audit", self.max_pages)
 
-        self.psi_cooldown = QDoubleSpinBox()
-        self.psi_cooldown.setRange(0.0, 60.0)
-        self.psi_cooldown.setSingleStep(0.5)
-        self.psi_cooldown.setValue(float(current["psi_cooldown_seconds"]))
-        form.addRow("PSI cooldown (seconds)", self.psi_cooldown)
-
         self.throttle = QDoubleSpinBox()
         self.throttle.setRange(0.0, 5.0)
         self.throttle.setSingleStep(0.1)
         self.throttle.setValue(float(current["request_throttle_seconds"]))
         form.addRow("HTTP throttle (seconds)", self.throttle)
 
-        self.prefer_crux = QCheckBox("Prefer CrUX first for CWV")
-        self.prefer_crux.setChecked(bool(current["prefer_crux_first"]))
-        form.addRow(self.prefer_crux)
+        self.parallel_checks = QCheckBox("Run parallel HTTP / media checks (faster)")
+        self.parallel_checks.setChecked(bool(current.get("parallel_checks", True)))
+        form.addRow(self.parallel_checks)
 
-        self.enable_cwv = QCheckBox("Enable Core Web Vitals checks")
-        self.enable_cwv.setChecked(bool(current.get("enable_core_web_vitals", False)))
-        form.addRow(self.enable_cwv)
+        self.parallel_workers = QSpinBox()
+        self.parallel_workers.setRange(2, 32)
+        self.parallel_workers.setValue(int(current.get("parallel_max_workers", 12)))
+        form.addRow("Parallel max workers", self.parallel_workers)
+        self.parallel_checks.toggled.connect(self.parallel_workers.setEnabled)
+        self.parallel_workers.setEnabled(self.parallel_checks.isChecked())
 
         self.ui_font_size = QSpinBox()
         self.ui_font_size.setRange(8, 20)
@@ -141,10 +144,9 @@ class SettingsDialog(QDialog):
             "max_links_per_check": int(self.max_links.value()),
             "fast_load_ms_threshold": int(self.fast_threshold.value()),
             "max_pages_to_audit": int(self.max_pages.value()),
-            "psi_cooldown_seconds": float(self.psi_cooldown.value()),
             "request_throttle_seconds": float(self.throttle.value()),
-            "prefer_crux_first": bool(self.prefer_crux.isChecked()),
-            "enable_core_web_vitals": bool(self.enable_cwv.isChecked()),
+            "parallel_checks": bool(self.parallel_checks.isChecked()),
+            "parallel_max_workers": int(self.parallel_workers.value()),
             "ui_font_size": int(self.ui_font_size.value()),
             "ui_theme": self.ui_theme.currentText(),
             "auto_save_last_run": bool(self.auto_save_last_run.isChecked()),
@@ -172,6 +174,51 @@ class RowConfigDialog(QDialog):
         return {k: bool(cb.isChecked()) for k, cb in self.checkboxes.items()}
 
 
+class ProgramInfoDialog(QDialog):
+    """Short reference for abbreviations and how checks work."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("How to read results")
+        self.resize(560, 420)
+        layout = QVBoxLayout(self)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(
+            "READING THE RESULTS TABLE\n"
+            "------------------------\n"
+            "• Y/N — Overall yes/no for that check (TBD = needs a human decision).\n"
+            "• Desktop / Mobile / Tablet — Outcome for that viewport profile (Pass / Fail / Manual).\n"
+            "• Notes — Extra detail; device labels are shortened:\n"
+            "    D: = Desktop    M: = Mobile    T: = Tablet\n"
+            "  Example: \"D: … | M: … | T: …\" means one note per device type.\n"
+            "• Manual — The tool could not finish automatically (often missing Chromium or timeouts).\n\n"
+            "SOCIAL MEDIA ROW\n"
+            "----------------\n"
+            "• The app only does a quick HTTP check on social URLs and optional name matching.\n"
+            "• It cannot prove a profile is the official business account.\n"
+            "• \"Conflict\" in notes means two different handles/accounts appeared for the same platform.\n"
+            "• Use the Social links list below the table to open URLs and verify by eye.\n\n"
+            "SPELLING & GRAMMAR\n"
+            "------------------\n"
+            "• Uses a dictionary heuristic — industry terms and names are often flagged.\n"
+            "• Each word shows example page URLs and short text snippets where it appeared.\n"
+            "• \"Add\" saves the word to your personal dictionary file (re-run the check to apply).\n\n"
+            "IMAGES & VIDEOS\n"
+            "---------------\n"
+            "• Automated only; CDNs, lazy loading, and embeds can cause false failures.\n"
+            "• If a row fails, confirm in a normal browser.\n\n"
+            "PERFORMANCE\n"
+            "-----------\n"
+            "• Settings → \"Parallel\" runs many link/media requests at once for speed.\n"
+            "• Lower \"Max pages\" or \"Max links\" if runs feel too slow.\n"
+        )
+        layout.addWidget(text)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+
 class AuditWorker(QThread):
     finished_ok = pyqtSignal(list)
     row_ready = pyqtSignal(object)
@@ -180,8 +227,7 @@ class AuditWorker(QThread):
     pages_checked_ready = pyqtSignal(list)
     spelling_issues_ready = pyqtSignal(list)
     row_details_ready = pyqtSignal(dict)
-    progress_non_cwv = pyqtSignal(int, int)
-    progress_cwv = pyqtSignal(int, int)
+    progress = pyqtSignal(int, int)
     failed = pyqtSignal(str)
 
     def __init__(self, url: str, settings: dict) -> None:
@@ -198,10 +244,7 @@ class AuditWorker(QThread):
                 self.status.emit(message)
 
             def emit_progress(done: int, total: int) -> None:
-                self.progress_non_cwv.emit(done, total)
-
-            def emit_progress_cwv(done: int, total: int) -> None:
-                self.progress_cwv.emit(done, total)
+                self.progress.emit(done, total)
 
             def emit_social_links(links: list, conflicts: list) -> None:
                 self.social_links_ready.emit(links, conflicts)
@@ -223,8 +266,7 @@ class AuditWorker(QThread):
                 on_pages_checked=emit_pages_checked,
                 on_spelling_issues=emit_spelling_issues,
                 on_row_details=emit_row_details,
-                on_progress_non_cwv=emit_progress,
-                on_progress_cwv=emit_progress_cwv,
+                on_progress=emit_progress,
                 settings=self.settings,
             )
             self.finished_ok.emit(results)
@@ -245,6 +287,7 @@ class MainWindow(QMainWindow):
         self.latest_pages_checked: list = []
         self.latest_spelling_issues: list = []
         self.worker: AuditWorker | None = None
+        self._report_meta: dict = {}
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -266,6 +309,10 @@ class MainWindow(QMainWindow):
         self.config_btn = QPushButton("Config")
         self.config_btn.clicked.connect(self.open_row_config)
         url_row.addWidget(self.config_btn)
+        self.info_btn = QPushButton("Info")
+        self.info_btn.setToolTip("What D:/M:/T: mean, social notes, spelling, etc.")
+        self.info_btn.clicked.connect(self.show_program_info)
+        url_row.addWidget(self.info_btn)
         layout.addLayout(url_row)
 
         business_row = QHBoxLayout()
@@ -280,21 +327,13 @@ class MainWindow(QMainWindow):
         self.status_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.status_label)
 
-        self.progress_non_cwv_label = QLabel("QA Checks Progress")
-        self.progress_non_cwv_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.progress_non_cwv_label)
-        self.progress_non_cwv_bar = QProgressBar()
-        self.progress_non_cwv_bar.setRange(0, 100)
-        self.progress_non_cwv_bar.setValue(0)
-        layout.addWidget(self.progress_non_cwv_bar)
-
-        self.progress_cwv_label = QLabel("Core Web Vitals Progress")
-        self.progress_cwv_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.progress_cwv_label)
-        self.progress_cwv_bar = QProgressBar()
-        self.progress_cwv_bar.setRange(0, 100)
-        self.progress_cwv_bar.setValue(0)
-        layout.addWidget(self.progress_cwv_bar)
+        self.progress_label = QLabel("Check progress")
+        self.progress_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.progress_label)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
 
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
@@ -352,10 +391,16 @@ class MainWindow(QMainWindow):
         self.spell_toggle.toggled.connect(self.toggle_spell_panel)
         layout.addWidget(self.spell_toggle)
 
-        self.spell_list = QListWidget()
-        self.spell_list.setVisible(False)
-        self.spell_list.setMinimumHeight(100)
-        layout.addWidget(self.spell_list)
+        self.spell_scroll = QScrollArea()
+        self.spell_scroll.setWidgetResizable(True)
+        self.spell_scroll.setVisible(False)
+        self.spell_scroll.setMinimumHeight(140)
+        self.spell_inner = QWidget()
+        self.spell_rows_layout = QVBoxLayout(self.spell_inner)
+        self.spell_rows_layout.setContentsMargins(4, 4, 4, 4)
+        self.spell_rows_layout.setSpacing(6)
+        self.spell_scroll.setWidget(self.spell_inner)
+        layout.addWidget(self.spell_scroll)
 
         history_row = QHBoxLayout()
         history_row.addWidget(QLabel("Recent runs:"))
@@ -364,24 +409,25 @@ class MainWindow(QMainWindow):
         self.load_history_btn = QPushButton("Load")
         self.load_history_btn.clicked.connect(self.load_selected_history_run)
         history_row.addWidget(self.load_history_btn)
+        self.export_report_btn = QPushButton("Export…")
+        self.export_report_btn.clicked.connect(self.export_current_report)
+        history_row.addWidget(self.export_report_btn)
         layout.addLayout(history_row)
         layout.setStretch(0, 0)  # URL row
         layout.setStretch(1, 0)  # business row
         layout.setStretch(2, 0)  # status
-        layout.setStretch(3, 0)  # non-CWV label
-        layout.setStretch(4, 0)  # non-CWV bar
-        layout.setStretch(5, 0)  # CWV label
-        layout.setStretch(6, 0)  # CWV bar
-        layout.setStretch(7, 1)  # table gets remaining height
-        layout.setStretch(8, 0)  # social label
-        layout.setStretch(9, 0)  # social toggle
-        layout.setStretch(10, 0)  # social list
-        layout.setStretch(11, 0)  # pages toggle
-        layout.setStretch(12, 0)  # pages list
-        layout.setStretch(13, 0)  # spell toggle
-        layout.setStretch(14, 0)  # spell list
-        layout.setStretch(15, 0)  # history row
-        layout.setStretch(16, 0)  # footer
+        layout.setStretch(3, 0)  # progress label
+        layout.setStretch(4, 0)  # progress bar
+        layout.setStretch(5, 1)  # table gets remaining height
+        layout.setStretch(6, 0)  # social label
+        layout.setStretch(7, 0)  # social toggle
+        layout.setStretch(8, 0)  # social list
+        layout.setStretch(9, 0)  # pages toggle
+        layout.setStretch(10, 0)  # pages list
+        layout.setStretch(11, 0)  # spell toggle
+        layout.setStretch(12, 0)  # spell list
+        layout.setStretch(13, 0)  # history row
+        layout.setStretch(14, 0)  # footer
 
         footer_row = QHBoxLayout()
         self.credit_label = QLabel("Created by: BMOandShiro")
@@ -427,13 +473,12 @@ class MainWindow(QMainWindow):
         self.social_toggle.setChecked(False)
         self.social_toggle.setText("Social links \u25be")
         self.pages_list.clear()
-        self.spell_list.clear()
+        self._clear_spell_rows()
         self.spell_toggle.setChecked(False)
         self.spell_toggle.setText("Spelling/grammar unknown words \u25be")
         self.social_label.setText("Social links (double-click to open)")
         self.status_label.setText("Running checks... this may take a minute.")
-        self.progress_non_cwv_bar.setValue(0)
-        self.progress_cwv_bar.setValue(0)
+        self.progress_bar.setValue(0)
         self.settings["expected_business_name"] = self.business_name_input.text().strip()
         self._save_settings()
         self.worker = AuditWorker(url, self.settings)
@@ -444,8 +489,7 @@ class MainWindow(QMainWindow):
         self.worker.pages_checked_ready.connect(self.on_pages_checked_ready)
         self.worker.spelling_issues_ready.connect(self.on_spelling_issues_ready)
         self.worker.row_details_ready.connect(self.on_row_details_ready)
-        self.worker.progress_non_cwv.connect(self.on_progress_non_cwv)
-        self.worker.progress_cwv.connect(self.on_progress_cwv)
+        self.worker.progress.connect(self.on_check_progress)
         self.worker.failed.connect(self.on_error)
         self.worker.start()
 
@@ -460,6 +504,12 @@ class MainWindow(QMainWindow):
                 return dict(DEFAULT_SETTINGS)
             merged = dict(DEFAULT_SETTINGS)
             merged.update(raw)
+            er = merged.get("enabled_rows")
+            if isinstance(er, dict):
+                er = dict(er)
+                er.pop("core_web_vitals", None)
+                er.pop("passable_design", None)
+                merged["enabled_rows"] = er
             return merged
         except Exception:
             return dict(DEFAULT_SETTINGS)
@@ -587,12 +637,14 @@ class MainWindow(QMainWindow):
             updated["results_history_dir"] = self.settings.get("results_history_dir", DEFAULT_SETTINGS["results_history_dir"])
             updated["expected_business_name"] = self.settings.get("expected_business_name", "")
             updated["enabled_rows"] = self.settings.get("enabled_rows", {})
+            updated["custom_spell_dictionary_path"] = self.settings.get(
+                "custom_spell_dictionary_path", DEFAULT_SETTINGS["custom_spell_dictionary_path"]
+            )
             self.settings = updated
             self._save_settings()
             self._apply_ui_font_size()
             self._apply_theme()
-            mode = "CrUX-first" if self.settings.get("prefer_crux_first") else "PSI-first"
-            self.status_label.setText(f"Settings saved ({mode}).")
+            self.status_label.setText("Settings saved.")
 
     def open_row_config(self) -> None:
         dialog = RowConfigDialog(self.settings, self)
@@ -601,16 +653,61 @@ class MainWindow(QMainWindow):
             self._save_settings()
             self.status_label.setText("Row config saved.")
 
+    def show_program_info(self) -> None:
+        ProgramInfoDialog(self).exec()
+
+    def _spell_dict_path(self) -> str:
+        p = str(self.settings.get("custom_spell_dictionary_path", "") or "").strip()
+        return p if p else CUSTOM_SPELL_DICT_PATH
+
+    def _clear_spell_rows(self) -> None:
+        while self.spell_rows_layout.count():
+            item = self.spell_rows_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def _add_word_to_dictionary(self, word: str) -> None:
+        w = word.strip()
+        if not w:
+            return
+        path = self._spell_dict_path()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        existing: set[str] = set()
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    existing = {ln.strip().lower() for ln in f if ln.strip() and not ln.strip().startswith("#")}
+            except OSError:
+                pass
+        if w.lower() in existing:
+            self.status_label.setText(f"'{w}' is already in your custom dictionary.")
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(w + "\n")
+        except OSError as exc:
+            self.status_label.setText(f"Could not save '{w}' to dictionary: {exc}")
+            return
+        self.status_label.setText(
+            f"Added '{w}' to custom dictionary. Re-run the check to refresh spelling."
+        )
+
     def on_success(self, results: list) -> None:
         self.results = results
         self._fit_qa_column()
         self.run_btn.setEnabled(True)
-        self.progress_non_cwv_bar.setValue(100)
-        self.progress_cwv_bar.setValue(100)
+        self.progress_bar.setValue(100)
         browser_missing = any("browser unavailable" in (r.notes or "").lower() for r in results)
         if bool(self.settings.get("auto_save_last_run", True)):
             self._save_current_run_to_history()
             self.refresh_history_dropdown()
+        else:
+            self._report_meta = {
+                "url": self.url_input.text().strip(),
+                "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "source_file": "",
+            }
         if browser_missing:
             self.status_label.setText("Complete with manual fallback: browser dependency missing. Click 'Install Browser Dependency'.")
             choice = QMessageBox.question(
@@ -635,19 +732,12 @@ class MainWindow(QMainWindow):
         # Add padding and clamp so the table remains usable.
         self.table.setColumnWidth(0, max(260, min(max_width + 28, 760)))
 
-    def on_progress_non_cwv(self, done: int, total: int) -> None:
+    def on_check_progress(self, done: int, total: int) -> None:
         if total <= 0:
-            self.progress_non_cwv_bar.setValue(0)
+            self.progress_bar.setValue(0)
             return
         pct = int((done / total) * 100)
-        self.progress_non_cwv_bar.setValue(max(0, min(100, pct)))
-
-    def on_progress_cwv(self, done: int, total: int) -> None:
-        if total <= 0:
-            self.progress_cwv_bar.setValue(0)
-            return
-        pct = int((done / total) * 100)
-        self.progress_cwv_bar.setValue(max(0, min(100, pct)))
+        self.progress_bar.setValue(max(0, min(100, pct)))
 
     def _append_row(self, result: CheckResult) -> None:
         row = asdict(result)
@@ -670,8 +760,7 @@ class MainWindow(QMainWindow):
 
     def on_error(self, message: str) -> None:
         self.run_btn.setEnabled(True)
-        self.progress_non_cwv_bar.setValue(0)
-        self.progress_cwv_bar.setValue(0)
+        self.progress_bar.setValue(0)
         self.status_label.setText("Check failed.")
         QMessageBox.critical(self, "Run failed", message)
 
@@ -683,7 +772,6 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.install_browser_btn.setEnabled(False)
         self.status_label.setText("Installing Chromium dependency...")
         try:
             install_playwright_chromium(timeout_s=600)
@@ -692,8 +780,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.status_label.setText("Browser install failed.")
             QMessageBox.critical(self, "Install failed", str(exc))
-        finally:
-            pass
 
     def on_social_links_ready(self, links: list, conflicts: list) -> None:
         self.latest_social_links = links
@@ -727,20 +813,251 @@ class MainWindow(QMainWindow):
         self.pages_list.setVisible(checked)
         self.pages_toggle.setText("Pages checked \u25b4" if checked else "Pages checked \u25be")
 
-    def on_spelling_issues_ready(self, words: list) -> None:
-        self.latest_spelling_issues = words
-        self.spell_list.clear()
-        for word in words:
-            self.spell_list.addItem(QListWidgetItem(word))
+    def on_spelling_issues_ready(self, items: list) -> None:
+        self.latest_spelling_issues = items
+        self._clear_spell_rows()
+        for raw in items:
+            if isinstance(raw, str):
+                entry: dict[str, Any] = {"word": raw, "pages": [], "snippets": []}
+            else:
+                entry = dict(raw) if isinstance(raw, dict) else {"word": str(raw), "pages": [], "snippets": []}
+            word = str(entry.get("word", "")).strip() or "(unknown)"
+            pages = entry.get("pages") or []
+            snippets = entry.get("snippets") or []
+
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(2, 2, 2, 2)
+            left = QVBoxLayout()
+            wlab = QLabel(word)
+            wf = wlab.font()
+            wf.setBold(True)
+            wlab.setFont(wf)
+            wlab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            left.addWidget(wlab)
+            if pages:
+                plab = QLabel("Pages: " + "; ".join(str(p) for p in pages[:6]))
+                plab.setWordWrap(True)
+                plab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                left.addWidget(plab)
+            if snippets:
+                slab = QLabel("Context: " + " | ".join(f"«{s}»" for s in snippets[:3]))
+                slab.setWordWrap(True)
+                slab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                left.addWidget(slab)
+            row_layout.addLayout(left, stretch=1)
+            add_btn = QPushButton("Add to dictionary")
+            add_btn.setToolTip(f"Append '{word}' to your personal word list")
+            add_btn.clicked.connect(lambda _checked=False, w=word: self._add_word_to_dictionary(w))
+            row_layout.addWidget(add_btn, alignment=Qt.AlignmentFlag.AlignTop)
+            self.spell_rows_layout.addWidget(row_widget)
 
     def toggle_spell_panel(self, checked: bool) -> None:
-        self.spell_list.setVisible(checked)
+        self.spell_scroll.setVisible(checked)
         self.spell_toggle.setText(
             "Spelling/grammar unknown words \u25b4" if checked else "Spelling/grammar unknown words \u25be"
         )
 
     def on_row_details_ready(self, details: dict) -> None:
         self.row_details_map = details
+
+    @staticmethod
+    def _abbrev_pass_cell(val: str) -> str:
+        v = (val or "").strip().lower()
+        if v in ("pass", "yes"):
+            return "Pass"
+        if v in ("fail", "no"):
+            return "Fail"
+        if v in ("manual", "tbd"):
+            return "Man"
+        return (val or "-")[:8]
+
+    @staticmethod
+    def _abbrev_overall_yes_no(yes_no: str) -> str:
+        v = (yes_no or "").strip().lower()
+        if v == "yes":
+            return "Pass"
+        if v == "no":
+            return "Fail"
+        if v == "tbd":
+            return "TBD"
+        return (yes_no or "-")[:6]
+
+    def _build_dashboard_lines(self) -> list[str]:
+        """Condensed pass/fail overview for export header."""
+        lines: list[str] = []
+        lines.append("QUICK DASHBOARD (pass / fail by check)")
+        lines.append("-" * 56)
+        hdr = f"{'Check':<46} {'Ovl':>4} {'D':>4} {'M':>4} {'T':>4}"
+        lines.append(hdr)
+        lines.append("-" * 56)
+        pass_ov = fail_ov = tbd_ov = 0
+        for r in self.results:
+            title = r.component
+            if len(title) > 46:
+                title = title[:43] + "..."
+            ovl = self._abbrev_overall_yes_no(r.yes_no)
+            yn = r.yes_no.strip().lower()
+            if yn == "yes":
+                pass_ov += 1
+            elif yn == "no":
+                fail_ov += 1
+            else:
+                tbd_ov += 1
+            lines.append(
+                f"{title:<46} {ovl:>4} {self._abbrev_pass_cell(r.desktop):>4} "
+                f"{self._abbrev_pass_cell(r.mobile):>4} {self._abbrev_pass_cell(r.tablet):>4}"
+            )
+        lines.append("-" * 56)
+        lines.append(
+            f"Counts — Pass: {pass_ov}   Fail: {fail_ov}   TBD/other: {tbd_ov}   (Overall column)"
+        )
+        lines.append("  Ovl = overall Y/N   D/M/T = Desktop / Mobile / Tablet")
+        return lines
+
+    @staticmethod
+    def _detail_export_order(keys: list[str]) -> list[str]:
+        """Put spelling detail before working-links detail; working links last."""
+        wl = "Working links & buttons"
+        sp = "Correct spelling & grammar, no typos"
+        rest = sorted(k for k in keys if k not in (wl, sp))
+        out = list(rest)
+        if sp in keys:
+            out.append(sp)
+        if wl in keys:
+            out.append(wl)
+        return out
+
+    def _build_export_report_text(self) -> str:
+        lines: list[str] = []
+        lines.append("AUTO WEBSITE CHECKER — REPORT")
+        lines.append("=" * 56)
+        meta = self._report_meta or {}
+        url = (meta.get("url") or self.url_input.text().strip() or "(unknown)").strip()
+        lines.append(f"URL: {url}")
+        saved_at = (meta.get("saved_at") or "").strip()
+        if saved_at:
+            lines.append(f"Run / saved at: {saved_at.replace('T', ' ')}")
+        if meta.get("source_file"):
+            lines.append(f"History file: {meta['source_file']}")
+        biz = self.business_name_input.text().strip() or str(self.settings.get("expected_business_name", "")).strip()
+        if biz:
+            lines.append(f"Expected business name: {biz}")
+        lines.append("")
+        lines.extend(self._build_dashboard_lines())
+        lines.append("")
+        lines.append("SUMMARY (main table)")
+        lines.append("-" * 56)
+        for r in self.results:
+            lines.append("")
+            lines.append(f"• {r.component}")
+            lines.append(
+                f"  Overall: {r.yes_no}   |   Desktop: {r.desktop}   Mobile: {r.mobile}   Tablet: {r.tablet}"
+            )
+            if (r.notes or "").strip():
+                lines.append(f"  Notes: {r.notes}")
+        lines.append("")
+        lines.append("DETAIL LISTS (same as expandable rows in the app)")
+        lines.append("-" * 56)
+        lines.append(
+            "Note: “Working links & buttons” sample URLs are listed last (below spelling), "
+            "since the list can be long."
+        )
+        if not self.row_details_map:
+            lines.append("(No row-level detail lists for this run.)")
+        else:
+            for comp in self._detail_export_order(list(self.row_details_map.keys())):
+                payload = self.row_details_map.get(comp) or {}
+                bad = payload.get("problematic") or []
+                ok = payload.get("ok") or []
+                if not bad and not ok:
+                    continue
+                lines.append("")
+                lines.append(f"--- {comp} ---")
+                lines.append(f"Problematic ({len(bad)}):")
+                for x in bad[:500]:
+                    lines.append(f"  - {x}")
+                if len(bad) > 500:
+                    lines.append(f"  … ({len(bad) - 500} more)")
+                lines.append(f"OK / reference ({len(ok)}):")
+                for x in ok[:500]:
+                    lines.append(f"  - {x}")
+                if len(ok) > 500:
+                    lines.append(f"  … ({len(ok) - 500} more)")
+        lines.append("")
+        lines.append("SOCIAL LINKS")
+        lines.append("-" * 56)
+        if self.latest_social_conflicts:
+            lines.append("Conflicts / multiple accounts detected:")
+            for c in self.latest_social_conflicts:
+                lines.append(f"  - {c}")
+            lines.append("")
+        if self.latest_social_links:
+            for entry in self.latest_social_links:
+                platform = entry.get("platform", "social")
+                surl = entry.get("url", "")
+                account = entry.get("account_key", "")
+                lines.append(f"  [{platform}] {account}  →  {surl}")
+        else:
+            lines.append("(None listed for this run.)")
+        lines.append("")
+        lines.append("PAGES CHECKED")
+        lines.append("-" * 56)
+        if self.latest_pages_checked:
+            for p in self.latest_pages_checked:
+                lines.append(f"  - {p}")
+        else:
+            lines.append("(None listed for this run.)")
+        lines.append("")
+        lines.append("SPELLING / GRAMMAR (unknown words — heuristic)")
+        lines.append("-" * 56)
+        if self.latest_spelling_issues:
+            for item in self.latest_spelling_issues:
+                if isinstance(item, dict):
+                    w = str(item.get("word", ""))
+                    pg = item.get("pages") or []
+                    sn = item.get("snippets") or []
+                    lines.append(f"  - {w}")
+                    if pg:
+                        lines.append(f"      Pages: {'; '.join(str(p) for p in pg[:8])}")
+                    if sn:
+                        lines.append(f"      Context: {' | '.join('«' + str(s) + '»' for s in sn[:4])}")
+                else:
+                    lines.append(f"  - {item}")
+        else:
+            lines.append("(None flagged for this run.)")
+        lines.append("")
+        lines.append("— End of report —")
+        return "\n".join(lines)
+
+    def export_current_report(self) -> None:
+        if not self.results:
+            QMessageBox.information(self, "Nothing to export", "Run a check or load a history entry first.")
+            return
+        default_name = "website-qa-report.txt"
+        url_slug = (self._report_meta.get("url") or self.url_input.text().strip() or "report").strip()
+        if url_slug.startswith(("http://", "https://")):
+            try:
+                host = urlparse(url_slug).netloc or "report"
+                default_name = f"qa-{host.replace(':', '-')}.txt"
+            except Exception:
+                pass
+        path, _filt = QFileDialog.getSaveFileName(
+            self,
+            "Export report",
+            default_name,
+            "Text report (*.txt);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            text = self._build_export_report_text()
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            self.status_label.setText(f"Exported report to {path}")
+            QMessageBox.information(self, "Export complete", f"Saved:\n{path}")
+        except OSError as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
 
     def _history_dir(self) -> str:
         d = str(self.settings.get("results_history_dir", DEFAULT_SETTINGS["results_history_dir"]))
@@ -766,6 +1083,38 @@ class MainWindow(QMainWindow):
         path = os.path.join(self._history_dir(), f"run-{stamp}.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(snapshot, f, indent=2)
+        self._report_meta = {
+            "url": snapshot["url"],
+            "saved_at": snapshot["saved_at"],
+            "source_file": os.path.basename(path),
+        }
+
+    @staticmethod
+    def _history_combo_label(full_path: str) -> str:
+        basename = os.path.basename(full_path)
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                snap = json.load(f)
+            url = (snap.get("url") or "").strip()
+            saved = (snap.get("saved_at") or "").strip()
+            if len(saved) >= 19:
+                saved_disp = saved[:19].replace("T", " ")
+            else:
+                m = re.match(
+                    r"run-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})\.json$",
+                    basename,
+                    re.I,
+                )
+                if m:
+                    saved_disp = f"{m.group(1)}-{m.group(2)}-{m.group(3)} {m.group(4)}:{m.group(5)}:{m.group(6)}"
+                else:
+                    saved_disp = basename
+            url_disp = url or "(no URL saved)"
+            if len(url_disp) > 64:
+                url_disp = url_disp[:61] + "..."
+            return f"{saved_disp}  —  {url_disp}"
+        except Exception:
+            return basename
 
     def refresh_history_dropdown(self) -> None:
         self.history_combo.clear()
@@ -781,8 +1130,7 @@ class MainWindow(QMainWindow):
                     continue
         files.sort(reverse=True)
         for _mtime, full in files[:10]:
-            label = os.path.basename(full)
-            self.history_combo.addItem(label, full)
+            self.history_combo.addItem(self._history_combo_label(full), full)
 
     def _render_loaded_results(self) -> None:
         self.table.setRowCount(0)
@@ -805,7 +1153,20 @@ class MainWindow(QMainWindow):
             self.latest_social_links = snap.get("social_links", []) or []
             self.latest_social_conflicts = snap.get("social_conflicts", []) or []
             self.latest_pages_checked = snap.get("pages_checked", []) or []
-            self.latest_spelling_issues = snap.get("spelling_issues", []) or []
+            spell_raw = snap.get("spelling_issues", []) or []
+            spell_norm: list = []
+            for x in spell_raw:
+                if isinstance(x, dict):
+                    spell_norm.append(x)
+                else:
+                    spell_norm.append({"word": str(x), "pages": [], "snippets": []})
+            self.latest_spelling_issues = spell_norm
+            self.url_input.setText(str(snap.get("url") or "").strip())
+            self._report_meta = {
+                "url": str(snap.get("url") or "").strip(),
+                "saved_at": str(snap.get("saved_at") or "").strip(),
+                "source_file": os.path.basename(path),
+            }
             self._render_loaded_results()
             self.status_label.setText(f"Loaded history: {os.path.basename(path)}")
         except Exception as exc:

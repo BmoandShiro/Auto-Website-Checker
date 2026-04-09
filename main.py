@@ -7,14 +7,13 @@ import argparse
 import csv
 import json
 import os
-import random
 import re
 import subprocess
 import sys
 import time
-import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Set, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -27,14 +26,16 @@ TIMEOUT_SECONDS = 30
 MAX_LINKS_PER_CHECK = 30
 FAST_LOAD_MS_THRESHOLD = 2500
 MAX_PAGES_TO_AUDIT = 5
-PSI_COOLDOWN_SECONDS = 3
 REQUEST_THROTTLE_SECONDS = 0.5
-PREFER_CRUX_FIRST = True
-ENABLE_CORE_WEB_VITALS = False
+PARALLEL_CHECKS = True
+PARALLEL_MAX_WORKERS = 12
+MANUAL_MEDIA_VERIFY_HINT = (
+    "If this automated check fails, open the site in a normal browser and confirm manually "
+    "(CDNs, lazy-load, and embeds often confuse automated probes)."
+)
 PHONE_PATTERN = re.compile(r"\+?\d[\d\-\(\)\s]{7,}\d")
 LAST_REQUEST_TS = 0.0
 QA_ROW_OPTIONS = [
-    ("passable_design", "If Inheriting an Exiting Website: Is it a passable design?"),
     ("speed_snappy", "Fast website/page load speed (Does it feel fast/snappy?)"),
     ("nav_responsive", "Navigation bar functionality - responsive menu bar"),
     ("links_buttons", "Working links & buttons"),
@@ -46,7 +47,6 @@ QA_ROW_OPTIONS = [
     ("social_links", "Social media links out to correct pages"),
     ("business_name", "Using correct business name"),
     ("rise_compat", "Rise Plugin Compatible (Wordpress)"),
-    ("core_web_vitals", "Core Web Vitals"),
 ]
 
 
@@ -110,18 +110,17 @@ DEVICE_PROFILES = [
 
 def apply_runtime_settings(settings: Dict[str, object] | None) -> None:
     global TIMEOUT_SECONDS, MAX_LINKS_PER_CHECK, FAST_LOAD_MS_THRESHOLD
-    global MAX_PAGES_TO_AUDIT, PSI_COOLDOWN_SECONDS, REQUEST_THROTTLE_SECONDS
-    global PREFER_CRUX_FIRST, ENABLE_CORE_WEB_VITALS
+    global MAX_PAGES_TO_AUDIT, REQUEST_THROTTLE_SECONDS
+    global PARALLEL_CHECKS, PARALLEL_MAX_WORKERS
     if not settings:
         return
     TIMEOUT_SECONDS = int(settings.get("timeout_seconds", TIMEOUT_SECONDS))
     MAX_LINKS_PER_CHECK = int(settings.get("max_links_per_check", MAX_LINKS_PER_CHECK))
     FAST_LOAD_MS_THRESHOLD = int(settings.get("fast_load_ms_threshold", FAST_LOAD_MS_THRESHOLD))
     MAX_PAGES_TO_AUDIT = int(settings.get("max_pages_to_audit", MAX_PAGES_TO_AUDIT))
-    PSI_COOLDOWN_SECONDS = float(settings.get("psi_cooldown_seconds", PSI_COOLDOWN_SECONDS))
     REQUEST_THROTTLE_SECONDS = float(settings.get("request_throttle_seconds", REQUEST_THROTTLE_SECONDS))
-    PREFER_CRUX_FIRST = bool(settings.get("prefer_crux_first", PREFER_CRUX_FIRST))
-    ENABLE_CORE_WEB_VITALS = bool(settings.get("enable_core_web_vitals", ENABLE_CORE_WEB_VITALS))
+    PARALLEL_CHECKS = bool(settings.get("parallel_checks", PARALLEL_CHECKS))
+    PARALLEL_MAX_WORKERS = max(2, min(32, int(settings.get("parallel_max_workers", PARALLEL_MAX_WORKERS))))
 
 
 def throttle_requests() -> None:
@@ -179,11 +178,34 @@ def check_link_set(urls: List[str], max_to_check: int | None = None) -> Tuple[bo
         max_to_check = MAX_LINKS_PER_CHECK
     if not urls:
         return False, "No links found", [], []
+    batch = urls[:max_to_check]
+    status_by_link: Dict[str, int] = {}
+
+    if PARALLEL_CHECKS and len(batch) > 1:
+        workers = min(PARALLEL_MAX_WORKERS, len(batch))
+
+        def _one(link: str) -> Tuple[str, int]:
+            try:
+                return link, fetch_status(link)
+            except Exception:
+                return link, 0
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_one, link) for link in batch]
+            for fut in as_completed(futures):
+                link, status = fut.result()
+                status_by_link[link] = status
+        for link in batch:
+            status_by_link.setdefault(link, 0)
+    else:
+        for link in batch:
+            status_by_link[link] = fetch_status(link)
+
     tested = 0
     failed: List[Tuple[str, int]] = []
     succeeded: List[str] = []
-    for link in urls[:max_to_check]:
-        status = fetch_status(link)
+    for link in batch:
+        status = status_by_link.get(link, 0)
         tested += 1
         if status == 0 or status >= 400:
             failed.append((link, status))
@@ -194,154 +216,6 @@ def check_link_set(urls: List[str], max_to_check: int | None = None) -> Tuple[bo
         failure_urls = [f"{u} ({s})" for u, s in failed]
         return False, f"{len(failed)}/{tested} failed: {preview}", failure_urls, succeeded
     return True, f"Checked {tested} links, all OK", [], succeeded
-
-
-def fetch_pagespeed_result(url: str, strategy: str, api_key: str = "") -> Dict[str, object]:
-    endpoint = (
-        "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
-        f"?url={url}&strategy={strategy}&category=PERFORMANCE"
-    )
-    if api_key:
-        endpoint += f"&key={api_key}"
-    throttle_requests()
-    req = Request(endpoint, headers={"User-Agent": USER_AGENT})
-    with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
-        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-    return payload
-
-
-def fetch_pagespeed_with_retry(
-    url: str, strategy: str, retries: int = 3, base_delay_s: float = 1.5, api_key: str = ""
-) -> Dict[str, object]:
-    last_exc: Exception | None = None
-    for attempt in range(retries + 1):
-        try:
-            return fetch_pagespeed_result(url, strategy, api_key=api_key)
-        except HTTPError as exc:
-            last_exc = exc
-            if exc.code == 429 and attempt < retries:
-                jitter = random.uniform(0.0, 0.75)
-                time.sleep((base_delay_s * (2**attempt)) + jitter)
-                continue
-            raise
-        except (URLError, ValueError, KeyError) as exc:
-            last_exc = exc
-            if attempt < retries:
-                jitter = random.uniform(0.0, 0.75)
-                time.sleep((base_delay_s * (2**attempt)) + jitter)
-                continue
-            raise
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError("Unknown PageSpeed retry failure")
-
-
-def fetch_crux_result(url: str, form_factor: str, api_key: str) -> Dict[str, object]:
-    endpoint = f"https://chromeuxreport.googleapis.com/v1/records:queryRecord?key={api_key}"
-    payload = json.dumps({"url": url, "formFactor": form_factor}).encode("utf-8")
-    throttle_requests()
-    req = Request(
-        endpoint,
-        data=payload,
-        headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
-        method="POST",
-    )
-    with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
-        return json.loads(resp.read().decode("utf-8", errors="replace"))
-
-
-def extract_crux_pass(payload: Dict[str, object]) -> Tuple[bool, str]:
-    record = payload.get("record", {})
-    metrics = record.get("metrics", {}) if isinstance(record, dict) else {}
-    if not isinstance(metrics, dict):
-        return False, "CrUX record has no metrics"
-
-    lcp = metrics.get("largest_contentful_paint", {}).get("percentiles", {}).get("p75")
-    inp = metrics.get("interaction_to_next_paint", {}).get("percentiles", {}).get("p75")
-    cls = metrics.get("cumulative_layout_shift", {}).get("percentiles", {}).get("p75")
-
-    if lcp is None or inp is None or cls is None:
-        return False, "CrUX missing LCP/INP/CLS p75"
-
-    cls_value = float(cls) / 1000.0
-    passed = int(lcp) <= 2500 and int(inp) <= 200 and cls_value <= 0.1
-    note = f"crux_p75 lcp={int(lcp)}ms inp={int(inp)}ms cls={cls_value:.3f}"
-    return passed, note
-
-
-def run_local_lighthouse_cwv(url: str, strategy: str, timeout_s: int = 120) -> Tuple[bool, str]:
-    # Free fallback when PSI/CrUX are unavailable or throttled.
-    form_factor = "desktop" if strategy == "desktop" else "mobile"
-    command = [
-        "npx",
-        "-y",
-        "lighthouse",
-        url,
-        "--quiet",
-        "--chrome-flags=--headless=new",
-        "--only-categories=performance",
-        f"--form-factor={form_factor}",
-        "--output=json",
-        "--output-path=stdout",
-    ]
-    try:
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=timeout_s, check=True)
-    except FileNotFoundError:
-        return False, "Lighthouse unavailable (npx not found)"
-    except subprocess.TimeoutExpired:
-        return False, "Lighthouse timeout"
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or "").strip()
-        return False, f"Lighthouse failed: {stderr[:200] if stderr else 'unknown error'}"
-
-    try:
-        payload = json.loads(proc.stdout)
-        audits = payload.get("audits", {})
-        perf_score = payload.get("categories", {}).get("performance", {}).get("score")
-        lcp = audits.get("largest-contentful-paint", {}).get("numericValue")
-        cls = audits.get("cumulative-layout-shift", {}).get("numericValue")
-        inp = audits.get("interaction-to-next-paint", {}).get("numericValue")
-        tbt = audits.get("total-blocking-time", {}).get("numericValue")
-
-        # CWV-style pass thresholds (lab fallback):
-        # LCP <= 2500ms, CLS <= 0.1, and INP <= 200ms if present; else TBT <= 200ms proxy.
-        if lcp is None or cls is None:
-            return False, "Lighthouse missing required metrics"
-        inp_or_tbt_ok = (inp is not None and inp <= 200) or (inp is None and tbt is not None and tbt <= 200)
-        passed = lcp <= 2500 and cls <= 0.1 and inp_or_tbt_ok
-        score_note = f"score={int(float(perf_score) * 100)}" if isinstance(perf_score, (int, float)) else "score=n/a"
-        detail = f"Lighthouse {score_note} lcp={int(lcp)}ms cls={cls:.3f}"
-        if inp is not None:
-            detail += f" inp={int(inp)}ms"
-        elif tbt is not None:
-            detail += f" tbt={int(tbt)}ms(proxy)"
-        return passed, detail
-    except Exception as exc:
-        return False, f"Lighthouse parse error: {exc}"
-
-
-def extract_core_web_vitals_pass(payload: Dict[str, object]) -> Tuple[bool, str]:
-    loading = payload.get("loadingExperience", {})
-    if isinstance(loading, dict):
-        overall = str(loading.get("overall_category", "UNKNOWN")).upper()
-        if overall and overall != "UNKNOWN":
-            return overall == "FAST", f"loadingExperience={overall}"
-
-    origin_loading = payload.get("originLoadingExperience", {})
-    if isinstance(origin_loading, dict):
-        overall = str(origin_loading.get("overall_category", "UNKNOWN")).upper()
-        if overall and overall != "UNKNOWN":
-            return overall == "FAST", f"originLoadingExperience={overall}"
-
-    lighthouse = payload.get("lighthouseResult", {})
-    if isinstance(lighthouse, dict):
-        categories = lighthouse.get("categories", {})
-        if isinstance(categories, dict):
-            performance = categories.get("performance", {})
-            if isinstance(performance, dict) and isinstance(performance.get("score"), (int, float)):
-                score = float(performance["score"]) * 100
-                return score >= 75, f"lighthouse_performance={score:.0f}"
-    return False, "No CWV field returned"
 
 
 def yn(value: bool) -> str:
@@ -459,11 +333,25 @@ def check_social_links(url: str, html: str) -> Tuple[bool, str]:
     links = normalize_links(url, hrefs)
     socials = [l for l in links if any(domain in l.lower() for domain in social_domains)]
     if not socials:
-        return False, "No social links found"
-    ok, note, failures, _ok_urls = check_link_set(socials, max_to_check=20)
+        return (
+            False,
+            "No outbound links to major social sites were found in the homepage HTML "
+            "(Facebook, Instagram, LinkedIn, X/Twitter, YouTube, TikTok).",
+        )
+    ok, _note, failures, _ok_urls = check_link_set(socials, max_to_check=20)
     if ok:
-        return True, f"Checked {len(socials)} social link(s), all OK"
-    return False, f"{note}; failures={', '.join(failures[:5])}"
+        return (
+            True,
+            f"Quick link check: {len(socials)} social URL(s) sampled and each returned a normal HTTP response. "
+            "This does not prove they are the correct official accounts—only that the URLs respond.",
+        )
+    fail_preview = "; ".join(failures[:5])
+    return (
+        False,
+        f"Quick link check: some social URLs did not return a clear success status. "
+        f"Examples: {fail_preview}. "
+        "Redirects, login walls, or bot blocking can cause false alarms—open each link in a browser to confirm.",
+    )
 
 
 def _social_platform(url: str) -> str:
@@ -514,22 +402,35 @@ def get_social_link_inventory(url: str, html: str) -> Tuple[List[Dict[str, str]]
 def check_social_links_with_business_hint(url: str, html: str, expected_business_name: str) -> Tuple[bool, str]:
     ok, note = check_social_links(url, html)
     if not expected_business_name.strip():
-        return ok, f"{note}; ownership correctness not verifiable without expected business name"
+        return (
+            ok,
+            f"{note} "
+            "Optional: enter the expected business name on the main screen—"
+            "the tool can then flag whether those words appear inside social URLs "
+            "(hint only; not proof the profile is official).",
+        )
     tokens = [t.lower() for t in re.findall(r"[a-zA-Z0-9]+", expected_business_name) if len(t) >= 4]
     hrefs = re.findall(r'href\s*=\s*["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
     links = normalize_links(url, hrefs)
     social_domains = ("facebook.com", "instagram.com", "linkedin.com", "x.com", "twitter.com", "youtube.com", "tiktok.com")
     socials = [l for l in links if any(domain in l.lower() for domain in social_domains)]
     if not socials:
-        return False, f"{note}; no social URLs to compare with business name"
+        return False, f"{note} (No social URLs to compare against the business name.)"
     if not tokens:
-        return ok, f"{note}; expected business name has no strong tokens"
+        return (
+            ok,
+            f"{note} The expected name has no words long enough (4+ letters) to match inside URLs automatically.",
+        )
     token_matches = 0
     for link in socials:
         lower = link.lower()
         if any(token in lower for token in tokens):
             token_matches += 1
-    return ok, f"{note}; name-token matches on {token_matches}/{len(socials)} social URLs"
+    hint = (
+        f"Name hint: words from your expected business name showed up in {token_matches} of {len(socials)} "
+        "social link(s). Many brands use handles that do not include the full business name—verify in the browser."
+    )
+    return ok, f"{note} {hint}"
 
 
 def check_noindex_discouraged(url: str, html: str) -> Tuple[bool, str]:
@@ -557,11 +458,22 @@ def extract_visible_text(html: str) -> str:
     return text
 
 
-def check_spelling_grammar(pages_html: List[str]) -> Tuple[bool, str, List[str]]:
-    sample_text = " ".join(extract_visible_text(h) for h in pages_html if h)
-    words = re.findall(r"\b[a-zA-Z]{4,}\b", sample_text)
-    if len(words) < 40:
-        return False, "Insufficient textual content for automated check", []
+def _load_custom_spell_words(spell: Any, dictionary_path: str) -> None:
+    if not dictionary_path or not os.path.isfile(dictionary_path):
+        return
+    try:
+        with open(dictionary_path, encoding="utf-8") as f:
+            for line in f:
+                w = line.strip().lower()
+                if w and not w.startswith("#"):
+                    spell.word_frequency.add(w)
+    except OSError:
+        pass
+
+
+def check_spelling_grammar(
+    page_url_html: List[Tuple[str, str]], custom_dictionary_path: str = ""
+) -> Tuple[bool, str, List[Dict[str, Any]]]:
     try:
         from spellchecker import SpellChecker  # type: ignore
     except Exception:
@@ -571,19 +483,73 @@ def check_spelling_grammar(pages_html: List[str]) -> Tuple[bool, str, List[str]]
         spell = SpellChecker()
     except Exception as exc:
         return False, f"Spell checker dictionary unavailable: {exc}", []
-    # limit sample for speed on very large pages
-    subset = [w.lower() for w in words[:3000]]
-    unknown = spell.unknown(subset)
-    error_rate = (len(unknown) / max(1, len(set(subset)))) * 100
+
+    _load_custom_spell_words(spell, custom_dictionary_path)
+
+    occurrences: List[Tuple[str, str, str]] = []
+    for page_url, html in page_url_html:
+        if not html:
+            continue
+        text = extract_visible_text(html)
+        for m in re.finditer(r"\b[a-zA-Z]{4,}\b", text):
+            if len(occurrences) >= 8000:
+                break
+            w = m.group(0).lower()
+            snip = text[max(0, m.start() - 35) : min(len(text), m.end() + 35)].strip()
+            snip = re.sub(r"\s+", " ", snip)
+            occurrences.append((w, page_url, snip))
+        if len(occurrences) >= 8000:
+            break
+
+    if len(occurrences) < 40:
+        return False, "Insufficient textual content for automated check", []
+
+    tokens = [w for w, _, _ in occurrences]
+    unique_tokens = list(dict.fromkeys(tokens))
+    sample = unique_tokens[:3000]
+    unknown_set: Set[str] = set(spell.unknown(sample))
+    error_rate = (len(unknown_set) / max(1, len(set(sample)))) * 100
     passed = error_rate <= 3.0
-    unknown_list = sorted(list(unknown))[:200]
-    return passed, f"Spelling heuristic unknown-word rate={error_rate:.1f}% (threshold<=3.0%)", unknown_list
+
+    by_word: Dict[str, Dict[str, Any]] = {}
+    for w, page_url, snip in occurrences:
+        if w not in unknown_set:
+            continue
+        if w not in by_word:
+            by_word[w] = {"word": w, "pages": [], "snippets": []}
+        entry = by_word[w]
+        if page_url not in entry["pages"]:
+            entry["pages"].append(page_url)
+        if len(entry["snippets"]) < 4 and snip and snip not in entry["snippets"]:
+            entry["snippets"].append(snip)
+
+    issues = sorted(by_word.values(), key=lambda x: str(x["word"]))[:200]
+    return passed, f"Spelling heuristic unknown-word rate={error_rate:.1f}% (threshold<=3.0%)", issues
+
+
+def _analyze_one_image(img_url: str) -> Dict[str, Any] | None:
+    try:
+        from PIL import Image, ImageFilter, ImageStat  # type: ignore
+        from io import BytesIO
+
+        req = Request(img_url, headers={"User-Agent": USER_AGENT})
+        with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+            data = resp.read()
+        img = Image.open(BytesIO(data)).convert("L")
+        w, h = img.size
+        lr = w < 300 or h < 200
+        edges = img.filter(ImageFilter.FIND_EDGES)
+        var = ImageStat.Stat(edges).var[0]
+        bl = var < 60
+        line = f"{img_url} (w={w}, h={h}, edge_var={var:.1f})"
+        return {"line": line, "blurry": bl, "low_res": lr, "bad": bl or lr}
+    except Exception:
+        return None
 
 
 def check_image_quality(url: str, pages_html: List[str]) -> Tuple[bool, str, List[str], List[str]]:
     try:
-        from PIL import Image, ImageFilter, ImageStat  # type: ignore
-        from io import BytesIO
+        from PIL import Image  # type: ignore  # noqa: F401
     except Exception:
         return False, "Pillow unavailable (install pillow)", [], []
 
@@ -594,39 +560,38 @@ def check_image_quality(url: str, pages_html: List[str]) -> Tuple[bool, str, Lis
     if not image_urls:
         return False, "No image URLs found", [], []
 
+    if PARALLEL_CHECKS and len(image_urls) > 1:
+        workers = min(PARALLEL_MAX_WORKERS, len(image_urls))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            raw_results = list(pool.map(_analyze_one_image, image_urls))
+    else:
+        raw_results = [_analyze_one_image(u) for u in image_urls]
+
     checked = 0
     blurry = 0
     low_res = 0
     bad_urls: List[str] = []
     ok_urls: List[str] = []
-    for img_url in image_urls:
-        try:
-            req = Request(img_url, headers={"User-Agent": USER_AGENT})
-            with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
-                data = resp.read()
-            img = Image.open(BytesIO(data)).convert("L")
-            w, h = img.size
-            checked += 1
-            if w < 300 or h < 200:
-                low_res += 1
-            edges = img.filter(ImageFilter.FIND_EDGES)
-            var = ImageStat.Stat(edges).var[0]
-            is_bad = False
-            if var < 60:
-                blurry += 1
-                is_bad = True
-            if w < 300 or h < 200:
-                is_bad = True
-            if is_bad:
-                bad_urls.append(f"{img_url} (w={w}, h={h}, edge_var={var:.1f})")
-            else:
-                ok_urls.append(f"{img_url} (w={w}, h={h}, edge_var={var:.1f})")
-        except Exception:
+    for item in raw_results:
+        if not item:
             continue
+        checked += 1
+        if item["blurry"]:
+            blurry += 1
+        if item["low_res"]:
+            low_res += 1
+        if item["bad"]:
+            bad_urls.append(str(item["line"]))
+        else:
+            ok_urls.append(str(item["line"]))
+
     if checked == 0:
-        return False, "Could not analyze images", [], []
+        return False, f"Could not analyze images. {MANUAL_MEDIA_VERIFY_HINT}", [], []
     passed = (blurry / checked) <= 0.4 and (low_res / checked) <= 0.5
-    return passed, f"Checked {checked} images; blurry={blurry}, low_res={low_res}", bad_urls, ok_urls
+    note = f"Checked {checked} images; blurry={blurry}, low_res={low_res}"
+    if not passed:
+        note = f"{note}. {MANUAL_MEDIA_VERIFY_HINT}"
+    return passed, note, bad_urls, ok_urls
 
 
 def check_videos_load(url: str, pages_html: List[str]) -> Tuple[bool, str, List[str], List[str]]:
@@ -643,25 +608,40 @@ def check_videos_load(url: str, pages_html: List[str]) -> Tuple[bool, str, List[
     video_urls = normalize_links(url, srcs)[:20]
     if not video_urls:
         return True, "No video sources found on checked pages", [], []
-    tested = 0
+
+    known_embed_domains = ("youtube.com", "youtu.be", "vimeo.com", "wistia.com", "loom.com")
+
+    def _check_one_video(video_url: str) -> Tuple[str, str]:
+        status = fetch_status(video_url)
+        if status == 0:
+            return "fail", f"{video_url} (no response)"
+        if status >= 400:
+            if status in (403, 405) and any(d in video_url.lower() for d in known_embed_domains):
+                return "ok", f"{video_url} ({status}, embed-allowed)"
+            return "fail", f"{video_url} ({status})"
+        return "ok", f"{video_url} ({status})"
+
+    if PARALLEL_CHECKS and len(video_urls) > 1:
+        workers = min(PARALLEL_MAX_WORKERS, len(video_urls))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            rows = list(pool.map(_check_one_video, video_urls))
+    else:
+        rows = [_check_one_video(u) for u in video_urls]
+
+    tested = len(rows)
     failures: List[str] = []
     ok_urls: List[str] = []
-    known_embed_domains = ("youtube.com", "youtu.be", "vimeo.com", "wistia.com", "loom.com")
-    for video_url in video_urls[:20]:
-        status = fetch_status(video_url)
-        tested += 1
-        # Many video hosts legitimately return 403/405 to bot-like checks while embeds still work in-browser.
-        if status == 0:
-            failures.append(f"{video_url} (no response)")
-        elif status >= 400:
-            if status in (403, 405) and any(d in video_url.lower() for d in known_embed_domains):
-                ok_urls.append(f"{video_url} ({status}, embed-allowed)")
-                continue
-            failures.append(f"{video_url} ({status})")
+    for kind, line in rows:
+        if kind == "ok":
+            ok_urls.append(line)
         else:
-            ok_urls.append(f"{video_url} ({status})")
+            failures.append(line)
     if failures:
-        return False, f"{len(failures)}/{tested} source checks failed; failures={', '.join(failures[:5])}", failures, ok_urls
+        note = (
+            f"{len(failures)}/{tested} video source checks failed. "
+            f"Examples: {', '.join(failures[:5])}. {MANUAL_MEDIA_VERIFY_HINT}"
+        )
+        return False, note, failures, ok_urls
     return True, f"Checked {tested} video source URL(s), all reachable/allowed", [], ok_urls
 
 
@@ -998,8 +978,7 @@ def build_results(
     on_pages_checked=None,
     on_spelling_issues=None,
     on_row_details=None,
-    on_progress_non_cwv=None,
-    on_progress_cwv=None,
+    on_progress=None,
     settings: Dict[str, object] | None = None,
 ) -> List[CheckResult]:
     apply_runtime_settings(settings)
@@ -1022,124 +1001,59 @@ def build_results(
             return True
         return bool(enabled_rows.get(row_key, True))
 
-    non_cwv_total = 1
-    non_cwv_done = 0
-    cwv_total = 1
-    cwv_done = 0
+    progress_total = 1
+    progress_done = 0
 
-    def init_non_cwv(total: int) -> None:
-        nonlocal non_cwv_total, non_cwv_done
-        non_cwv_total = max(1, total)
-        non_cwv_done = 0
-        if on_progress_non_cwv:
-            on_progress_non_cwv(0, non_cwv_total)
+    def init_progress(total: int) -> None:
+        nonlocal progress_total, progress_done
+        progress_total = max(1, total)
+        progress_done = 0
+        if on_progress:
+            on_progress(0, progress_total)
 
-    def step_non_cwv() -> None:
-        nonlocal non_cwv_done
-        non_cwv_done += 1
-        if on_progress_non_cwv:
-            on_progress_non_cwv(min(non_cwv_done, non_cwv_total), non_cwv_total)
-
-    def init_cwv(total: int) -> None:
-        nonlocal cwv_total, cwv_done
-        cwv_total = max(1, total)
-        cwv_done = 0
-        if on_progress_cwv:
-            on_progress_cwv(0, cwv_total)
-
-    def step_cwv() -> None:
-        nonlocal cwv_done
-        cwv_done += 1
-        if on_progress_cwv:
-            on_progress_cwv(min(cwv_done, cwv_total), cwv_total)
-
-    desktop_cwv_ok, desktop_cwv_note = False, "Unavailable"
-    mobile_cwv_ok, mobile_cwv_note = False, "Unavailable"
-    psi_key = os.getenv("PSI_API_KEY", "").strip()
-    crux_key = os.getenv("CRUX_API_KEY", "").strip() or psi_key
-
-    def evaluate_cwv(strategy: str, form_factor: str) -> Tuple[bool, str]:
-        psi_error = ""
-        crux_error = ""
-        if PREFER_CRUX_FIRST and crux_key:
-            try:
-                crux_payload = fetch_crux_result(url, form_factor, crux_key)
-                ok, note = extract_crux_pass(crux_payload)
-                return ok, f"CrUX {note}"
-            except (HTTPError, URLError, ValueError, KeyError) as exc:
-                crux_error = f"CrUX error: {exc}"
-
-        try:
-            psi_payload = fetch_pagespeed_with_retry(url, strategy, api_key=psi_key)
-            ok, note = extract_core_web_vitals_pass(psi_payload)
-            if crux_error:
-                return ok, f"PSI {note}; fallback_from_{crux_error}"
-            return ok, f"PSI {note}"
-        except (HTTPError, URLError, ValueError, KeyError) as exc:
-            psi_error = f"PSI error: {exc}"
-
-        if (not PREFER_CRUX_FIRST) and crux_key:
-            try:
-                crux_payload = fetch_crux_result(url, form_factor, crux_key)
-                ok, note = extract_crux_pass(crux_payload)
-                return ok, f"{psi_error}; fallback=CrUX {note}"
-            except (HTTPError, URLError, ValueError, KeyError) as exc:
-                lighthouse_ok, lighthouse_note = run_local_lighthouse_cwv(url, strategy)
-                return lighthouse_ok, f"{psi_error}; CrUX error: {exc}; fallback={lighthouse_note}"
-
-        if crux_error:
-            lighthouse_ok, lighthouse_note = run_local_lighthouse_cwv(url, strategy)
-            return lighthouse_ok, f"{crux_error}; {psi_error}; fallback={lighthouse_note}"
-        lighthouse_ok, lighthouse_note = run_local_lighthouse_cwv(url, strategy)
-        return lighthouse_ok, f"{psi_error or 'CWV unavailable'}; fallback={lighthouse_note}"
-
-    run_cwv_row = row_enabled("core_web_vitals")
-    init_cwv(2 if (ENABLE_CORE_WEB_VITALS and run_cwv_row) else 1)
-
-    def run_cwv_flow() -> None:
-        nonlocal desktop_cwv_ok, desktop_cwv_note, mobile_cwv_ok, mobile_cwv_note
-        if ENABLE_CORE_WEB_VITALS and run_cwv_row:
-            emit_status("Checking Core Web Vitals (desktop)...")
-            desktop_cwv_ok, desktop_cwv_note = evaluate_cwv("desktop", "DESKTOP")
-            step_cwv()
-
-            # Cool down between PSI calls to reduce API throttling.
-            time.sleep(PSI_COOLDOWN_SECONDS)
-
-            emit_status("Checking Core Web Vitals (mobile/tablet)...")
-            mobile_cwv_ok, mobile_cwv_note = evaluate_cwv("mobile", "PHONE")
-            step_cwv()
-        else:
-            desktop_cwv_ok, desktop_cwv_note = False, "Skipped (Core Web Vitals disabled in Settings)"
-            mobile_cwv_ok, mobile_cwv_note = False, "Skipped (Core Web Vitals disabled in Settings)"
-            step_cwv()
-
-    cwv_thread = threading.Thread(target=run_cwv_flow, daemon=True)
-    cwv_thread.start()
+    def step_progress() -> None:
+        nonlocal progress_done
+        progress_done += 1
+        if on_progress:
+            on_progress(min(progress_done, progress_total), progress_total)
 
     emit_status("Discovering internal pages...")
     pages = discover_internal_pages(url, max_pages=max_pages)
     if on_pages_checked:
         on_pages_checked(pages)
-    selected_non_cwv_rows = sum(1 for key, _ in QA_ROW_OPTIONS if key != "core_web_vitals" and row_enabled(key))
-    non_cwv_steps = 1 + (len(pages) * len(DEVICE_PROFILES)) + selected_non_cwv_rows
-    init_non_cwv(non_cwv_steps)
-    step_non_cwv()
+    selected_rows = sum(1 for key, _ in QA_ROW_OPTIONS if row_enabled(key))
+    progress_steps = 1 + (len(pages) * len(DEVICE_PROFILES)) + selected_rows
+    init_progress(progress_steps)
+    step_progress()
     emit_status(f"Auditing {len(pages)} page(s) across desktop/mobile/tablet...")
-    audits, raw_audits = run_device_audits(pages, on_audit_complete=step_non_cwv)
+    audits, raw_audits = run_device_audits(pages, on_audit_complete=step_progress)
 
     desktop = audits["desktop"]
     mobile = audits["mobile"]
     tablet = audits["tablet"]
     browser_unavailable = "browser unavailable" in desktop.links_note.lower()
     is_wp, wp_note = detect_wordpress(url)
-    pages_html: List[str] = []
-    for p in pages:
+
+    def _fetch_pair(page_url: str) -> Tuple[str, str]:
         try:
-            pages_html.append(fetch_html(p))
+            return page_url, fetch_html(page_url)
         except Exception:
-            continue
+            return page_url, ""
+
+    if PARALLEL_CHECKS and len(pages) > 1:
+        fw = min(PARALLEL_MAX_WORKERS, len(pages))
+        with ThreadPoolExecutor(max_workers=fw) as pool:
+            pairs = list(pool.map(_fetch_pair, pages))
+    else:
+        pairs = [_fetch_pair(p) for p in pages]
+
+    page_url_html = [(u, h) for u, h in pairs if h]
+    pages_html = [h for _, h in page_url_html]
     homepage_html = pages_html[0] if pages_html else ""
+
+    spell_dict_path = str((settings or {}).get("custom_spell_dictionary_path", "")).strip()
+    if not spell_dict_path:
+        spell_dict_path = os.path.join(os.path.expanduser("~"), ".auto_website_checker", "custom_spell_words.txt")
     expected_business_name = str((settings or {}).get("expected_business_name", "")).strip()
     social_ok, social_note = (False, "Skipped by config")
     if row_enabled("social_links"):
@@ -1151,9 +1065,10 @@ def build_results(
     social_inventory, social_conflicts = get_social_link_inventory(url, homepage_html) if homepage_html else ([], [])
     if on_social_links:
         on_social_links(social_inventory, social_conflicts)
-    spell_ok, spell_note, spelling_issues = (False, "Skipped by config", [])
+    spelling_issues: List[Any] = []
+    spell_ok, spell_note = False, "Skipped by config"
     if row_enabled("spelling_grammar"):
-        spell_ok, spell_note, spelling_issues = check_spelling_grammar(pages_html)
+        spell_ok, spell_note, spelling_issues = check_spelling_grammar(page_url_html, spell_dict_path)
         if on_spelling_issues:
             on_spelling_issues(spelling_issues)
     img_ok, img_note, image_bad, image_ok = (False, "Skipped by config", [], [])
@@ -1167,22 +1082,7 @@ def build_results(
         name_ok, name_note = check_business_name(pages_html, expected_business_name)
 
     rows: List[CheckResult] = []
-    emit_status("Waiting for Core Web Vitals check to finish...")
-    cwv_thread.join()
 
-    if row_enabled("passable_design"):
-        emit_row(
-        CheckResult(
-            component="If Inheriting an Exiting Website: Is it a passable design?",
-            yes_no="TBD",
-            desktop="Manual",
-            mobile="Manual",
-            tablet="Manual",
-            notes="Manual visual/brand quality review required per device.",
-        ),
-        rows,
-        )
-        step_non_cwv()
     if row_enabled("speed_snappy"):
         emit_row(
         CheckResult(
@@ -1202,7 +1102,7 @@ def build_results(
         ),
         rows,
         )
-        step_non_cwv()
+        step_progress()
     if row_enabled("nav_responsive"):
         emit_row(
         CheckResult(
@@ -1215,7 +1115,7 @@ def build_results(
         ),
         rows,
         )
-        step_non_cwv()
+        step_progress()
     if row_enabled("links_buttons"):
         emit_row(
         CheckResult(
@@ -1228,7 +1128,7 @@ def build_results(
         ),
         rows,
         )
-        step_non_cwv()
+        step_progress()
     if row_enabled("phone_in_header"):
         emit_row(
         CheckResult(
@@ -1241,7 +1141,7 @@ def build_results(
         ),
         rows,
         )
-        step_non_cwv()
+        step_progress()
     if row_enabled("footer_links"):
         emit_row(
         CheckResult(
@@ -1254,7 +1154,7 @@ def build_results(
         ),
         rows,
         )
-        step_non_cwv()
+        step_progress()
     if row_enabled("spelling_grammar"):
         emit_row(
         CheckResult(
@@ -1267,7 +1167,7 @@ def build_results(
         ),
         rows,
         )
-        step_non_cwv()
+        step_progress()
     if row_enabled("images_quality"):
         emit_row(
         CheckResult(
@@ -1280,7 +1180,7 @@ def build_results(
         ),
         rows,
         )
-        step_non_cwv()
+        step_progress()
     if row_enabled("videos_load"):
         emit_row(
         CheckResult(
@@ -1293,7 +1193,7 @@ def build_results(
         ),
         rows,
         )
-        step_non_cwv()
+        step_progress()
     if row_enabled("social_links"):
         emit_row(
         CheckResult(
@@ -1303,13 +1203,18 @@ def build_results(
             mobile=pf(social_ok),
             tablet=pf(social_ok),
             notes=(
-                "Reachability + name-token hint (not ownership-proof). "
-                f"{social_note}; conflicts={', '.join(social_conflicts) if social_conflicts else 'none'}"
+                f"{social_note}"
+                + (
+                    f" (Conflict warning: more than one handle found for the same platform type: "
+                    f"{', '.join(social_conflicts)}.)"
+                    if social_conflicts
+                    else ""
+                )
             ),
         ),
         rows,
         )
-        step_non_cwv()
+        step_progress()
     if row_enabled("business_name"):
         emit_row(
         CheckResult(
@@ -1322,7 +1227,7 @@ def build_results(
         ),
         rows,
         )
-        step_non_cwv()
+        step_progress()
     if row_enabled("rise_compat"):
         emit_row(
         CheckResult(
@@ -1335,56 +1240,21 @@ def build_results(
         ),
         rows,
         )
-        step_non_cwv()
-    if row_enabled("core_web_vitals"):
-        emit_row(
-        CheckResult(
-            component="Core Web Vitals",
-            yes_no=(
-                "TBD"
-                if (
-                    "too many requests" in desktop_cwv_note.lower()
-                    or "too many requests" in mobile_cwv_note.lower()
-                    or "unavailable" in desktop_cwv_note.lower()
-                    or "unavailable" in mobile_cwv_note.lower()
-                    or "skipped (core web vitals disabled" in desktop_cwv_note.lower()
-                    or "skipped (core web vitals disabled" in mobile_cwv_note.lower()
-                )
-                else yn(desktop_cwv_ok and mobile_cwv_ok)
-            ),
-            desktop=(
-                "Manual"
-                if (
-                    "too many requests" in desktop_cwv_note.lower()
-                    or "unavailable" in desktop_cwv_note.lower()
-                    or "skipped (core web vitals disabled" in desktop_cwv_note.lower()
-                )
-                else pf(desktop_cwv_ok)
-            ),
-            mobile=(
-                "Manual"
-                if (
-                    "too many requests" in mobile_cwv_note.lower()
-                    or "unavailable" in mobile_cwv_note.lower()
-                    or "skipped (core web vitals disabled" in mobile_cwv_note.lower()
-                )
-                else pf(mobile_cwv_ok)
-            ),
-            tablet=(
-                "Manual"
-                if (
-                    "too many requests" in mobile_cwv_note.lower()
-                    or "unavailable" in mobile_cwv_note.lower()
-                    or "skipped (core web vitals disabled" in mobile_cwv_note.lower()
-                )
-                else pf(mobile_cwv_ok)
-            ),
-            notes=f"Desktop {desktop_cwv_note}; Mobile/Tablet {mobile_cwv_note}; pages_audited={len(pages)}",
-        ),
-        rows,
-        )
+        step_progress()
     emit_status("Finalizing results...")
     if on_row_details:
+
+        def _spell_detail_line(it: Any) -> str:
+            if not isinstance(it, dict):
+                return str(it)
+            w = str(it.get("word", ""))
+            pg = it.get("pages") or []
+            sn = it.get("snippets") or []
+            pages_s = ", ".join(str(p) for p in pg[:5])
+            if sn:
+                return f"{w} — pages: {pages_s} — e.g. «{sn[0]}»"
+            return f"{w} — pages: {pages_s}"
+
         working_links_bad: List[str] = []
         working_links_ok: List[str] = []
         slow_pages: List[str] = []
@@ -1414,7 +1284,7 @@ def build_results(
                 "ok": pages,
             },
             "Correct spelling & grammar, no typos": {
-                "problematic": spelling_issues[:200],
+                "problematic": [_spell_detail_line(it) for it in spelling_issues[:200]],
                 "ok": [],
             },
             "Images are compressed, high resolution, not blurry or pixelated": {
