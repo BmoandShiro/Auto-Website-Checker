@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -335,7 +336,7 @@ def check_social_links(url: str, html: str) -> Tuple[bool, str]:
     if not socials:
         return (
             False,
-            "No outbound links to major social sites were found in the homepage HTML "
+            "No outbound links to major social sites were found in the audited page HTML "
             "(Facebook, Instagram, LinkedIn, X/Twitter, YouTube, TikTok).",
         )
     ok, _note, failures, _ok_urls = check_link_set(socials, max_to_check=20)
@@ -528,6 +529,12 @@ def check_spelling_grammar(
 
 
 def _analyze_one_image(img_url: str) -> Dict[str, Any] | None:
+    """
+    Blur-only heuristic (pass/fail):
+      Grayscale → FIND_EDGES → variance of edge map. High variance ≈ lots of detail/sharp edges;
+      low variance ≈ smooth or blurry imagery. Threshold 60 is coarse; low-res but sharp images
+      are not penalized (no pixel-dimension checks).
+    """
     try:
         from PIL import Image, ImageFilter, ImageStat  # type: ignore
         from io import BytesIO
@@ -537,26 +544,55 @@ def _analyze_one_image(img_url: str) -> Dict[str, Any] | None:
             data = resp.read()
         img = Image.open(BytesIO(data)).convert("L")
         w, h = img.size
-        lr = w < 300 or h < 200
         edges = img.filter(ImageFilter.FIND_EDGES)
         var = ImageStat.Stat(edges).var[0]
-        bl = var < 60
+        bl = var < 60.0
         line = f"{img_url} (w={w}, h={h}, edge_var={var:.1f})"
-        return {"line": line, "blurry": bl, "low_res": lr, "bad": bl or lr}
+        return {"line": line, "blurry": bl, "bad": bl}
     except Exception:
         return None
 
 
-def check_image_quality(url: str, pages_html: List[str]) -> Tuple[bool, str, List[str], List[str]]:
+def check_image_quality(
+    url: str, page_url_html: List[Tuple[str, str]], max_samples: int = 20
+) -> Tuple[bool, str, List[str], List[str]]:
     try:
         from PIL import Image  # type: ignore  # noqa: F401
     except Exception:
         return False, "Pillow unavailable (install pillow)", [], []
 
-    srcs: List[str] = []
-    for html in pages_html:
-        srcs.extend(re.findall(r'<img[^>]+src\s*=\s*["\']([^"\']+)["\']', html, flags=re.IGNORECASE))
-    image_urls = normalize_links(url, srcs)[:20]
+    # Per-page img lists, then shuffle page order and round-robin pick URLs so samples
+    # spread across different pages (better chance to catch issues sitewide).
+    page_lists: List[List[str]] = []
+    for _pu, html in page_url_html:
+        if not html:
+            continue
+        srcs = re.findall(r'<img[^>]+src\s*=\s*["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+        normalized = normalize_links(url, srcs)
+        if normalized:
+            page_lists.append(normalized)
+    if not page_lists:
+        return False, "No image URLs found", [], []
+
+    order = list(range(len(page_lists)))
+    random.shuffle(order)
+    shuffled = [page_lists[i] for i in order]
+
+    image_urls: List[str] = []
+    seen: set[str] = set()
+    round_idx = 0
+    while len(image_urls) < max_samples:
+        added = False
+        for pl in shuffled:
+            if round_idx < len(pl) and pl[round_idx] not in seen:
+                seen.add(pl[round_idx])
+                image_urls.append(pl[round_idx])
+                added = True
+                if len(image_urls) >= max_samples:
+                    break
+        if not added:
+            break
+        round_idx += 1
     if not image_urls:
         return False, "No image URLs found", [], []
 
@@ -569,7 +605,6 @@ def check_image_quality(url: str, pages_html: List[str]) -> Tuple[bool, str, Lis
 
     checked = 0
     blurry = 0
-    low_res = 0
     bad_urls: List[str] = []
     ok_urls: List[str] = []
     for item in raw_results:
@@ -578,8 +613,6 @@ def check_image_quality(url: str, pages_html: List[str]) -> Tuple[bool, str, Lis
         checked += 1
         if item["blurry"]:
             blurry += 1
-        if item["low_res"]:
-            low_res += 1
         if item["bad"]:
             bad_urls.append(str(item["line"]))
         else:
@@ -587,8 +620,11 @@ def check_image_quality(url: str, pages_html: List[str]) -> Tuple[bool, str, Lis
 
     if checked == 0:
         return False, f"Could not analyze images. {MANUAL_MEDIA_VERIFY_HINT}", [], []
-    passed = (blurry / checked) <= 0.4 and (low_res / checked) <= 0.5
-    note = f"Checked {checked} images; blurry={blurry}, low_res={low_res}"
+    passed = (blurry / checked) <= 0.4
+    note = (
+        f"Checked {checked} image(s) sampled across {len(page_lists)} page(s) (shuffled round-robin); "
+        f"blurry (edge-variance heuristic)={blurry}/{checked}"
+    )
     if not passed:
         note = f"{note}. {MANUAL_MEDIA_VERIFY_HINT}"
     return passed, note, bad_urls, ok_urls
@@ -1049,7 +1085,7 @@ def build_results(
 
     page_url_html = [(u, h) for u, h in pairs if h]
     pages_html = [h for _, h in page_url_html]
-    homepage_html = pages_html[0] if pages_html else ""
+    combined_social_html = "\n".join(pages_html) if pages_html else ""
 
     spell_dict_path = str((settings or {}).get("custom_spell_dictionary_path", "")).strip()
     if not spell_dict_path:
@@ -1058,11 +1094,13 @@ def build_results(
     social_ok, social_note = (False, "Skipped by config")
     if row_enabled("social_links"):
         social_ok, social_note = (
-            check_social_links_with_business_hint(url, homepage_html, expected_business_name)
-            if homepage_html
+            check_social_links_with_business_hint(url, combined_social_html, expected_business_name)
+            if combined_social_html
             else (False, "Unable to fetch page HTML")
         )
-    social_inventory, social_conflicts = get_social_link_inventory(url, homepage_html) if homepage_html else ([], [])
+    social_inventory, social_conflicts = (
+        get_social_link_inventory(url, combined_social_html) if combined_social_html else ([], [])
+    )
     if on_social_links:
         on_social_links(social_inventory, social_conflicts)
     spelling_issues: List[Any] = []
@@ -1073,7 +1111,7 @@ def build_results(
             on_spelling_issues(spelling_issues)
     img_ok, img_note, image_bad, image_ok = (False, "Skipped by config", [], [])
     if row_enabled("images_quality"):
-        img_ok, img_note, image_bad, image_ok = check_image_quality(url, pages_html)
+        img_ok, img_note, image_bad, image_ok = check_image_quality(url, page_url_html)
     video_ok, video_note, video_bad, video_ok_urls = (False, "Skipped by config", [], [])
     if row_enabled("videos_load"):
         video_ok, video_note, video_bad, video_ok_urls = check_videos_load(url, pages_html)
@@ -1195,24 +1233,29 @@ def build_results(
         )
         step_progress()
     if row_enabled("social_links"):
+        social_na = (
+            not social_inventory
+            and bool(combined_social_html)
+            and "Unable to fetch" not in social_note
+        )
         emit_row(
-        CheckResult(
-            component="Social media links out to correct pages",
-            yes_no=yn(social_ok),
-            desktop=pf(social_ok),
-            mobile=pf(social_ok),
-            tablet=pf(social_ok),
-            notes=(
-                f"{social_note}"
-                + (
-                    f" (Conflict warning: more than one handle found for the same platform type: "
-                    f"{', '.join(social_conflicts)}.)"
-                    if social_conflicts
-                    else ""
-                )
+            CheckResult(
+                component="Social media links out to correct pages",
+                yes_no=("N/A" if social_na else yn(social_ok)),
+                desktop=("N/A" if social_na else pf(social_ok)),
+                mobile=("N/A" if social_na else pf(social_ok)),
+                tablet=("N/A" if social_na else pf(social_ok)),
+                notes=(
+                    f"{social_note}"
+                    + (
+                        f" (Conflict warning: more than one handle found for the same platform type: "
+                        f"{', '.join(social_conflicts)}.)"
+                        if social_conflicts
+                        else ""
+                    )
+                ),
             ),
-        ),
-        rows,
+            rows,
         )
         step_progress()
     if row_enabled("business_name"):

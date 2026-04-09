@@ -192,7 +192,14 @@ class ProgramInfoDialog(QDialog):
             "• Notes — Extra detail; device labels are shortened:\n"
             "    D: = Desktop    M: = Mobile    T: = Tablet\n"
             "  Example: \"D: … | M: … | T: …\" means one note per device type.\n"
-            "• Manual — The tool could not finish automatically (often missing Chromium or timeouts).\n\n"
+            "• Manual — The tool could not finish automatically (often missing Chromium or timeouts).\n"
+            "• N/A — Not applicable for that check (e.g. no social links found to evaluate).\n\n"
+            "SCOPE (MAX PAGES SETTING)\n"
+            "-------------------------\n"
+            "• \"Max pages to audit\" limits how many internal URLs are discovered and then used for:\n"
+            "  browser runs (desktop/mobile/tablet), fetched HTML, spelling, images, videos,\n"
+            "  business name, and social-link detection (combined across those pages).\n"
+            "• WordPress detection uses the starting URL only.\n\n"
             "SOCIAL MEDIA ROW\n"
             "----------------\n"
             "• The app only does a quick HTTP check on social URLs and optional name matching.\n"
@@ -206,7 +213,8 @@ class ProgramInfoDialog(QDialog):
             "• \"Add\" saves the word to your personal dictionary file (re-run the check to apply).\n\n"
             "IMAGES & VIDEOS\n"
             "---------------\n"
-            "• Automated only; CDNs, lazy loading, and embeds can cause false failures.\n"
+            "• Images: pass/fail is blur-only (edge-detection variance); small but sharp files are OK.\n"
+            "• Videos: URL reachability; CDNs and embeds can confuse checks.\n"
             "• If a row fails, confirm in a normal browser.\n\n"
             "PERFORMANCE\n"
             "-----------\n"
@@ -450,6 +458,9 @@ class MainWindow(QMainWindow):
         elif normalized in ("no", "fail"):
             item.setBackground(QColor(255, 199, 206))
             item.setForeground(QColor(156, 0, 6))
+        elif normalized in ("n/a", "na"):
+            item.setBackground(QColor(228, 228, 231))
+            item.setForeground(QColor(63, 63, 70))
 
     def run_audit(self) -> None:
         url = self.url_input.text().strip()
@@ -667,7 +678,7 @@ class MainWindow(QMainWindow):
             if w is not None:
                 w.deleteLater()
 
-    def _add_word_to_dictionary(self, word: str) -> None:
+    def _add_word_to_dictionary(self, word: str, add_btn: QPushButton | None = None) -> None:
         w = word.strip()
         if not w:
             return
@@ -682,6 +693,8 @@ class MainWindow(QMainWindow):
                 pass
         if w.lower() in existing:
             self.status_label.setText(f"'{w}' is already in your custom dictionary.")
+            if add_btn is not None:
+                add_btn.setVisible(False)
             return
         try:
             with open(path, "a", encoding="utf-8") as f:
@@ -689,6 +702,8 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             self.status_label.setText(f"Could not save '{w}' to dictionary: {exc}")
             return
+        if add_btn is not None:
+            add_btn.setVisible(False)
         self.status_label.setText(
             f"Added '{w}' to custom dictionary. Re-run the check to refresh spelling."
         )
@@ -848,7 +863,9 @@ class MainWindow(QMainWindow):
             row_layout.addLayout(left, stretch=1)
             add_btn = QPushButton("Add to dictionary")
             add_btn.setToolTip(f"Append '{word}' to your personal word list")
-            add_btn.clicked.connect(lambda _checked=False, w=word: self._add_word_to_dictionary(w))
+            add_btn.clicked.connect(
+                lambda _checked=False, w=word, b=add_btn: self._add_word_to_dictionary(w, b)
+            )
             row_layout.addWidget(add_btn, alignment=Qt.AlignmentFlag.AlignTop)
             self.spell_rows_layout.addWidget(row_widget)
 
@@ -870,6 +887,8 @@ class MainWindow(QMainWindow):
             return "Fail"
         if v in ("manual", "tbd"):
             return "Man"
+        if v in ("n/a", "na"):
+            return "N/A"
         return (val or "-")[:8]
 
     @staticmethod
@@ -881,6 +900,8 @@ class MainWindow(QMainWindow):
             return "Fail"
         if v == "tbd":
             return "TBD"
+        if v in ("n/a", "na"):
+            return "N/A"
         return (yes_no or "-")[:6]
 
     def _build_dashboard_lines(self) -> list[str]:
@@ -891,7 +912,7 @@ class MainWindow(QMainWindow):
         hdr = f"{'Check':<46} {'Ovl':>4} {'D':>4} {'M':>4} {'T':>4}"
         lines.append(hdr)
         lines.append("-" * 56)
-        pass_ov = fail_ov = tbd_ov = 0
+        pass_ov = fail_ov = tbd_ov = na_ov = 0
         for r in self.results:
             title = r.component
             if len(title) > 46:
@@ -902,6 +923,8 @@ class MainWindow(QMainWindow):
                 pass_ov += 1
             elif yn == "no":
                 fail_ov += 1
+            elif yn in ("n/a", "na"):
+                na_ov += 1
             else:
                 tbd_ov += 1
             lines.append(
@@ -910,9 +933,9 @@ class MainWindow(QMainWindow):
             )
         lines.append("-" * 56)
         lines.append(
-            f"Counts — Pass: {pass_ov}   Fail: {fail_ov}   TBD/other: {tbd_ov}   (Overall column)"
+            f"Counts — Pass: {pass_ov}   Fail: {fail_ov}   N/A: {na_ov}   TBD/other: {tbd_ov}   (Overall column)"
         )
-        lines.append("  Ovl = overall Y/N   D/M/T = Desktop / Mobile / Tablet")
+        lines.append("  Ovl = overall Y/N   D/M/T = Desktop / Mobile / Tablet   N/A = not applicable")
         return lines
 
     @staticmethod
