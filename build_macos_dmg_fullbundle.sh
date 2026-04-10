@@ -11,6 +11,7 @@ python3 -m PyInstaller \
   --clean \
   --windowed \
   --name "AutoWebsiteChecker" \
+  --osx-bundle-identifier com.autowebsitechecker.app \
   --collect-data "spellchecker" \
   --add-data "settings.json:." \
   --add-data "run-history:run-history" \
@@ -21,6 +22,9 @@ python3 -m PyInstaller \
 echo "Install bundled Chromium into app Resources..."
 export PLAYWRIGHT_BROWSERS_PATH="$(pwd)/dist/AutoWebsiteChecker.app/Contents/Resources/ms-playwright"
 python3 -m playwright install chromium
+
+# Playwright adds files after PyInstaller sealed the bundle; resign so Gatekeeper does not report "damaged".
+codesign --force --deep --sign - "dist/AutoWebsiteChecker.app"
 
 echo "Create DMG..."
 mkdir -p dist/dmg

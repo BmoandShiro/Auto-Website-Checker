@@ -979,9 +979,24 @@ def install_playwright_chromium(timeout_s: int = 600) -> None:
         driver_exe, cli_path = compute_driver_executable()
         subprocess.run([driver_exe, cli_path, "install", "chromium"], check=True, timeout=timeout_s)
         return
-    except Exception:
-        # Fallback for normal source environments.
+    except Exception as first_exc:
+        if getattr(sys, "frozen", False):
+            raise RuntimeError(
+                "Could not install Chromium from the packaged Playwright driver. "
+                "Try rebuilding the app with browsers bundled, or reinstall the application."
+            ) from first_exc
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, timeout=timeout_s)
+
+
+def _frozen_playwright_user_browsers_dir() -> str:
+    """Writable location for Chromium when the .app bundle has no bundled browsers."""
+    if sys.platform == "darwin":
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "AutoWebsiteChecker")
+    elif sys.platform == "win32":
+        base = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "AutoWebsiteChecker")
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".local", "share", "AutoWebsiteChecker")
+    return os.path.join(base, "ms-playwright")
 
 
 def configure_playwright_env_for_bundle() -> None:
@@ -989,7 +1004,9 @@ def configure_playwright_env_for_bundle() -> None:
     If running from a packaged app, force Playwright to use bundled browsers
     from an app-local `ms-playwright` directory.
     """
-    if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+    # Playwright treats "0" as "default cache"; do not let it block bundle detection in frozen apps.
+    raw_pw = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+    if raw_pw.strip() and raw_pw.strip() != "0":
         return
     candidates: List[str] = []
     if getattr(sys, "frozen", False):
@@ -1002,7 +1019,11 @@ def configure_playwright_env_for_bundle() -> None:
     for path in candidates:
         if os.path.isdir(path):
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = path
-            break
+            return
+    if getattr(sys, "frozen", False):
+        user_path = _frozen_playwright_user_browsers_dir()
+        os.makedirs(user_path, exist_ok=True)
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = user_path
 
 
 def build_results(

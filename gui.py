@@ -1258,19 +1258,34 @@ class MainWindow(QMainWindow):
         if url:
             webbrowser.open(url)
 
-def main() -> int:
-    app = QApplication(sys.argv)
-    # Ensure icon works both in source runs and PyInstaller bundles.
+def _resolve_app_icon_path() -> str:
+    """PyInstaller macOS .app may place data under _MEIPASS or Contents/Resources."""
     if getattr(sys, "frozen", False):
-        base_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
-    else:
-        base_dir = os.path.dirname(__file__)
-    icon_path = os.path.join(base_dir, "assets", "app-icon.png")
-    if os.path.exists(icon_path):
-        icon = QIcon(icon_path)
-        app.setWindowIcon(icon)
+        candidates: List[str] = []
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(meipass)
+        exe_dir = os.path.dirname(sys.executable)
+        candidates.append(exe_dir)
+        candidates.append(os.path.abspath(os.path.join(exe_dir, "..", "Resources")))
+        for base in candidates:
+            p = os.path.join(base, "assets", "app-icon.png")
+            if os.path.exists(p):
+                return p
+        return ""
+    p = os.path.join(os.path.dirname(__file__), "assets", "app-icon.png")
+    return p if os.path.exists(p) else ""
+
+
+def main() -> int:
+    if sys.platform == "darwin":
+        os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
+    app = QApplication(sys.argv)
+    icon_path = _resolve_app_icon_path()
+    if icon_path:
+        app.setWindowIcon(QIcon(icon_path))
     window = MainWindow()
-    if os.path.exists(icon_path):
+    if icon_path:
         window.setWindowIcon(QIcon(icon_path))
     window.show()
     return app.exec()
