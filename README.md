@@ -1,75 +1,78 @@
-# Auto Website Checker
+# Website Auditer
 
-Simple Python CLI tool that automates your website UX QA checklist section with real device emulation.
+Website Auditer helps you run structured, pass/fail style checks on a site: emulated **desktop**, **mobile**, and **tablet** views, HTTP link checks, spelling, images, videos, social links, optional business-name matching, and WordPress detection. Use the **PyQt6 GUI** for an interactive table of results, or the **CLI** for CSV output.
 
 ## What it checks
 
-- If Inheriting an Exiting Website: Is it a passable design? (manual/TBD)
-- Fast website/page load speed (Does it feel fast/snappy?) (desktop/mobile/tablet measured)
-- Navigation bar functionality - responsive menu bar (desktop/mobile/tablet emulated)
-- Working links & buttons (desktop/mobile/tablet)
-- Phone Number Present in Head (NOT Only Book Online) (desktop/mobile/tablet)
-- Footer functionality - working links (desktop/mobile/tablet)
-- Rise Plugin Compatible (Wordpress) (manual/TBD)
-- Core Web Vitals (desktop/mobile via PSI API; tablet mirrors mobile)
+Each row can be toggled in the GUI **Config** dialog:
 
-Manual/TBD rows are still included for:
-- passable design review
-- Rise plugin compatibility
+- Fast website/page load speed (desktop/mobile/tablet)
+- Navigation bar — responsive menu
+- Working links and buttons
+- Phone number present in header (not only “book online”)
+- Footer — working links
+- Spelling and grammar
+- Images — resolution / blur heuristic
+- Videos — load / reachability
+- Social media links vs expected pages
+- Business name usage (with optional expected name)
+- Rise plugin compatible (WordPress) — manual / TBD style
 
 ## Requirements
 
 - Python 3.10+
-- Install dependencies:
+- Dependencies and Chromium (for browser-based checks):
 
 ```bash
 pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-## Usage
+## GUI (recommended)
 
-`python main.py https://example.com --out qa_results.csv`
+```bash
+python gui.py
+```
 
-If `python` is not recognized on your machine, use:
+On Windows: `py -3 gui.py` or `run_gui.bat`.
 
-`py -3 main.py https://example.com --out qa_results.csv`
+Paste a URL, optionally set **Expected business name**, then **Run Check**. Use **Settings** for timeouts, themes, and parallelism; **Info** explains the table and each area of the tool.
 
-## GUI app (PyQt6)
+Portable builds embed Chromium next to the app when you use the build scripts or CI (see below).
 
-Run:
+## CLI
 
-`python gui.py`
+```bash
+python main.py https://example.com --out qa_results.csv
+```
 
-or
+If `python` is not on your PATH:
 
-`py -3 gui.py`
+```bash
+py -3 main.py https://example.com --out qa_results.csv
+```
 
-GUI features:
-- Paste website URL
-- Click **Run Check**
-- View results in a table (Desktop/Mobile/Tablet columns)
-- Save displayed results to CSV
+## Building portable apps
 
-## Windows helper scripts
+| Platform | Script / workflow | Output |
+|----------|-------------------|--------|
+| Windows (one folder + bundled Chromium) | `build_portable_dir.bat` | `dist/WebsiteAuditer/` |
+| Windows (single EXE) | `build_portable_onefile.bat` | `dist/WebsiteAuditer.exe` |
+| macOS DMG | `build_macos_dmg.sh` (on a Mac) | `dist/WebsiteAuditer.dmg` |
 
-- Run GUI:
-  - `run_gui.bat`
-- Build portable one-file EXE:
-  - `build_portable_onefile.bat`
-  - Output: `dist/AutoWebsiteChecker.exe`
+PyInstaller uses `assets/app-icon.png` for the window and executable/bundle icon (via Pillow at build time). GitHub Actions **Build Portable Artifacts** uploads matching artifacts (`WebsiteAuditer-windows-dir`, `WebsiteAuditer-windows-exe`, `WebsiteAuditer-macos-dmg`).
 
-## macOS DMG build
+Optional: `python -m PyInstaller WebsiteAuditer.spec` (adjust the spec if you change data files).
 
-- Use `build_macos_dmg.sh` on a Mac (cannot build DMG on Windows)
-- Output: `dist/AutoWebsiteChecker.dmg`
+## CLI CSV columns
 
-## Output
+- QA Component  
+- Y/N  
+- Desktop Pass/Fail  
+- Mobile Pass/Fail  
+- Tablet Pass/Fail  
+- Notes  
 
-Creates a CSV with columns:
-- QA Component
-- Y/N
-- Desktop Pass/Fail
-- Mobile Pass/Fail
-- Tablet Pass/Fail
-- Notes
+## Acknowledgements
+
+macOS testing and feedback: @nathanringraham.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Auto Website Checker with device-emulated QA checks."""
+"""Website Auditer with device-emulated QA checks."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from urllib.request import Request, urlopen
 from playwright.sync_api import Browser, BrowserContext, Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 
-USER_AGENT = "Mozilla/5.0 (compatible; AutoWebsiteChecker/1.0)"
+USER_AGENT = "Mozilla/5.0 (compatible; WebsiteAuditer/1.0)"
 TIMEOUT_SECONDS = 30
 MAX_LINKS_PER_CHECK = 30
 FAST_LOAD_MS_THRESHOLD = 2500
@@ -991,11 +991,11 @@ def install_playwright_chromium(timeout_s: int = 600) -> None:
 def _frozen_playwright_user_browsers_dir() -> str:
     """Writable location for Chromium when the .app bundle has no bundled browsers."""
     if sys.platform == "darwin":
-        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "AutoWebsiteChecker")
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "WebsiteAuditer")
     elif sys.platform == "win32":
-        base = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "AutoWebsiteChecker")
+        base = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "WebsiteAuditer")
     else:
-        base = os.path.join(os.path.expanduser("~"), ".local", "share", "AutoWebsiteChecker")
+        base = os.path.join(os.path.expanduser("~"), ".local", "share", "WebsiteAuditer")
     return os.path.join(base, "ms-playwright")
 
 
@@ -1110,7 +1110,7 @@ def build_results(
 
     spell_dict_path = str((settings or {}).get("custom_spell_dictionary_path", "")).strip()
     if not spell_dict_path:
-        spell_dict_path = os.path.join(os.path.expanduser("~"), ".auto_website_checker", "custom_spell_words.txt")
+        spell_dict_path = os.path.join(os.path.expanduser("~"), ".website_auditer", "custom_spell_words.txt")
     expected_business_name = str((settings or {}).get("expected_business_name", "")).strip()
     social_ok, social_note = (False, "Skipped by config")
     if row_enabled("social_links"):
@@ -1373,7 +1373,7 @@ def write_csv(results: List[CheckResult], path: str) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Automate website UX QA checks")
+    parser = argparse.ArgumentParser(description="Website Auditer — automated website UX QA checks")
     parser.add_argument("url", help="Website URL, e.g. https://example.com")
     parser.add_argument("--out", default="qa_results.csv", help="Output CSV file")
     parser.add_argument("--max-pages", type=int, default=MAX_PAGES_TO_AUDIT, help="Max internal pages to audit")

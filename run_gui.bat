@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-echo Starting Auto Website Checker GUI...
+echo Starting Website Auditer GUI...
 py -3 gui.py
 
 endlocal

@@ -10,8 +10,9 @@ python3 -m PyInstaller \
   --noconfirm \
   --clean \
   --windowed \
-  --name "AutoWebsiteChecker" \
-  --osx-bundle-identifier com.autowebsitechecker.app \
+  --name "WebsiteAuditer" \
+  --icon "assets/app-icon.png" \
+  --osx-bundle-identifier com.websiteauditer.app \
   --collect-data "spellchecker" \
   --add-data "settings.json:." \
   --add-data "run-history:run-history" \
@@ -20,15 +21,15 @@ python3 -m PyInstaller \
   "gui.py"
 
 echo "Install bundled Chromium into app Resources..."
-export PLAYWRIGHT_BROWSERS_PATH="$(pwd)/dist/AutoWebsiteChecker.app/Contents/Resources/ms-playwright"
+export PLAYWRIGHT_BROWSERS_PATH="$(pwd)/dist/WebsiteAuditer.app/Contents/Resources/ms-playwright"
 python3 -m playwright install chromium
 
 # Playwright adds files after PyInstaller sealed the bundle; resign so Gatekeeper does not report "damaged".
-codesign --force --deep --sign - "dist/AutoWebsiteChecker.app"
+codesign --force --deep --sign - "dist/WebsiteAuditer.app"
 
 echo "Create DMG (requires macOS + hdiutil)..."
 mkdir -p dist/dmg
-cp -R "dist/AutoWebsiteChecker.app" "dist/dmg/"
-hdiutil create -volname "AutoWebsiteChecker" -srcfolder "dist/dmg" -ov -format UDZO "dist/AutoWebsiteChecker.dmg"
+cp -R "dist/WebsiteAuditer.app" "dist/dmg/"
+hdiutil create -volname "Website Auditer" -srcfolder "dist/dmg" -ov -format UDZO "dist/WebsiteAuditer.dmg"
 
-echo "Done: dist/AutoWebsiteChecker.dmg"
+echo "Done: dist/WebsiteAuditer.dmg"

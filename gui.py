@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simple PyQt6 GUI for Auto Website Checker."""
+"""Simple PyQt6 GUI for Website Auditer."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ from PyQt6.QtWidgets import (
 from main import QA_ROW_OPTIONS, CheckResult, build_results, install_playwright_chromium, is_chromium_available
 
 
-APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".auto_website_checker")
+APP_DATA_DIR = os.path.join(os.path.expanduser("~"), ".website_auditer")
 SETTINGS_PATH = os.path.join(APP_DATA_DIR, "settings.json")
 CUSTOM_SPELL_DICT_PATH = os.path.join(APP_DATA_DIR, "custom_spell_words.txt")
 DEFAULT_SETTINGS = {
@@ -67,6 +67,8 @@ DEFAULT_SETTINGS = {
     "results_history_dir": os.path.join(APP_DATA_DIR, "run-history"),
     "ui_theme": "Dark Gray + Blue Accent",
 }
+
+APP_VERSION = "v0.2.0-beta"
 
 
 class SettingsDialog(QDialog):
@@ -175,16 +177,26 @@ class RowConfigDialog(QDialog):
 
 
 class ProgramInfoDialog(QDialog):
-    """Short reference for abbreviations and how checks work."""
+    """About the app plus a short reference for abbreviations and how checks work."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("How to read results")
-        self.resize(560, 420)
+        self.setWindowTitle("Website Auditer — Help")
+        self.resize(580, 520)
         layout = QVBoxLayout(self)
         text = QTextEdit()
         text.setReadOnly(True)
         text.setPlainText(
+            "ABOUT WEBSITE AUDITER\n"
+            "---------------------\n"
+            f"Website Auditer ({APP_VERSION}) runs automated, QA-style checks on a website you choose: "
+            "desktop, mobile, and tablet browser emulation, HTTP link checks, spelling, images, videos, "
+            "social links, business name hints, and WordPress detection — with clear Pass / Fail / Manual "
+            "or TBD where a person should decide.\n\n"
+            "Enter a URL (https is added if you omit it), optionally set Expected Business Name for "
+            "matching checks, then Run Check. Use Settings for timeouts, themes, parallelism, and "
+            "Config to turn individual table rows on or off. Browser-based rows need Chromium; if they "
+            "show Manual, try Install Browser Dependency or confirm Chromium is installed.\n\n"
             "READING THE RESULTS TABLE\n"
             "------------------------\n"
             "• Y/N — Overall yes/no for that check (TBD = needs a human decision).\n"
@@ -192,7 +204,7 @@ class ProgramInfoDialog(QDialog):
             "• Notes — Extra detail; device labels are shortened:\n"
             "    D: = Desktop    M: = Mobile    T: = Tablet\n"
             "  Example: \"D: … | M: … | T: …\" means one note per device type.\n"
-            "• Manual — The tool could not finish automatically (often missing Chromium or timeouts).\n"
+            "• Manual — Website Auditer could not finish automatically (often missing Chromium or timeouts).\n"
             "• N/A — Not applicable for that check (e.g. no social links found to evaluate).\n\n"
             "SCOPE (MAX PAGES SETTING)\n"
             "-------------------------\n"
@@ -202,7 +214,7 @@ class ProgramInfoDialog(QDialog):
             "• WordPress detection uses the starting URL only.\n\n"
             "SOCIAL MEDIA ROW\n"
             "----------------\n"
-            "• The app only does a quick HTTP check on social URLs and optional name matching.\n"
+            "• Website Auditer only does a quick HTTP check on social URLs and optional name matching.\n"
             "• It cannot prove a profile is the official business account.\n"
             "• \"Conflict\" in notes means two different handles/accounts appeared for the same platform.\n"
             "• Use the Social links list below the table to open URLs and verify by eye.\n\n"
@@ -285,7 +297,7 @@ class AuditWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Auto Website Checker")
+        self.setWindowTitle("Website Auditer")
         self.resize(1100, 600)
         self.settings = self._load_settings()
         self.results: List[CheckResult] = []
@@ -318,7 +330,7 @@ class MainWindow(QMainWindow):
         self.config_btn.clicked.connect(self.open_row_config)
         url_row.addWidget(self.config_btn)
         self.info_btn = QPushButton("Info")
-        self.info_btn.setToolTip("What D:/M:/T: mean, social notes, spelling, etc.")
+        self.info_btn.setToolTip("About Website Auditer, how to read results, and what each check means.")
         self.info_btn.clicked.connect(self.show_program_info)
         url_row.addWidget(self.info_btn)
         layout.addLayout(url_row)
@@ -439,7 +451,7 @@ class MainWindow(QMainWindow):
 
         footer_row = QHBoxLayout()
         self.credit_label = QLabel("Created by: BMOandShiro")
-        self.version_label = QLabel("v0.1.0-alpha")
+        self.version_label = QLabel(APP_VERSION)
         footer_row.addWidget(self.credit_label)
         footer_row.addStretch()
         footer_row.addWidget(self.version_label)
@@ -1281,6 +1293,7 @@ def main() -> int:
     if sys.platform == "darwin":
         os.environ.setdefault("QT_MAC_WANTS_LAYER", "1")
     app = QApplication(sys.argv)
+    app.setApplicationName("Website Auditer")
     icon_path = _resolve_app_icon_path()
     if icon_path:
         app.setWindowIcon(QIcon(icon_path))

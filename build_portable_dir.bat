@@ -10,7 +10,8 @@ py -3 -m PyInstaller ^
   --noconfirm ^
   --clean ^
   --windowed ^
-  --name "AutoWebsiteChecker" ^
+  --name "WebsiteAuditer" ^
+  --icon "assets\app-icon.png" ^
   --collect-data "spellchecker" ^
   --add-data "settings.json;." ^
   --add-data "run-history;run-history" ^
@@ -18,13 +19,13 @@ py -3 -m PyInstaller ^
   "gui.py"
 
 echo Installing bundled Chromium into dist folder...
-set PLAYWRIGHT_BROWSERS_PATH=%cd%\dist\AutoWebsiteChecker\ms-playwright
+set PLAYWRIGHT_BROWSERS_PATH=%cd%\dist\WebsiteAuditer\ms-playwright
 py -3 -m playwright install chromium
 
-if exist "dist\AutoWebsiteChecker\AutoWebsiteChecker.exe" (
+if exist "dist\WebsiteAuditer\WebsiteAuditer.exe" (
   echo.
   echo Build complete:
-  echo   %cd%\dist\AutoWebsiteChecker\
+  echo   %cd%\dist\WebsiteAuditer\
 ) else (
   echo Build failed.
   exit /b 1

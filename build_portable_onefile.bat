@@ -14,17 +14,18 @@ py -3 -m PyInstaller ^
   --clean ^
   --onefile ^
   --windowed ^
-  --name "AutoWebsiteChecker" ^
+  --name "WebsiteAuditer" ^
+  --icon "assets\app-icon.png" ^
   --collect-data "spellchecker" ^
   --add-data "settings.json;." ^
   --add-data "run-history;run-history" ^
   --add-data "assets\\app-icon.png;assets" ^
   "gui.py"
 
-if exist "dist\AutoWebsiteChecker.exe" (
+if exist "dist\WebsiteAuditer.exe" (
   echo.
   echo Build complete:
-  echo   %cd%\dist\AutoWebsiteChecker.exe
+  echo   %cd%\dist\WebsiteAuditer.exe
 ) else (
   echo Build failed.
   exit /b 1
