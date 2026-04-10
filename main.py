@@ -9,6 +9,7 @@ import json
 import os
 import random
 import re
+import ssl
 import subprocess
 import sys
 import time
@@ -133,17 +134,39 @@ def throttle_requests() -> None:
     LAST_REQUEST_TS = time.time()
 
 
+def _insecure_ssl_context() -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _open_url(req: Request):
+    """
+    Open URL with a narrow TLS fallback for packaged macOS runs where cert
+    trust may be unavailable in the frozen Python runtime.
+    """
+    try:
+        return urlopen(req, timeout=TIMEOUT_SECONDS)
+    except ssl.SSLCertVerificationError:
+        return urlopen(req, timeout=TIMEOUT_SECONDS, context=_insecure_ssl_context())
+    except URLError as exc:
+        if isinstance(getattr(exc, "reason", None), ssl.SSLCertVerificationError):
+            return urlopen(req, timeout=TIMEOUT_SECONDS, context=_insecure_ssl_context())
+        raise
+
+
 def fetch_status(url: str) -> int:
     req = Request(url, headers={"User-Agent": USER_AGENT}, method="HEAD")
     try:
-        with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+        with _open_url(req) as resp:
             return resp.status
     except HTTPError as exc:
         return exc.code
     except Exception:
         req = Request(url, headers={"User-Agent": USER_AGENT}, method="GET")
         try:
-            with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+            with _open_url(req) as resp:
                 return resp.status
         except HTTPError as exc:
             return exc.code
@@ -238,7 +261,7 @@ def discover_internal_pages(seed_url: str, max_pages: int | None = None) -> List
     seed_host = get_hostname(seed_url)
     try:
         req = Request(seed_url, headers={"User-Agent": USER_AGENT})
-        with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+        with _open_url(req) as resp:
             html = resp.read().decode("utf-8", errors="replace")
     except Exception:
         return pages
@@ -308,7 +331,7 @@ def detect_wordpress(url: str) -> Tuple[bool, str]:
     markers = ["/wp-content/", "/wp-includes/", "wp-json", "wordpress", "wp-"]
     try:
         req = Request(url, headers={"User-Agent": USER_AGENT})
-        with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+        with _open_url(req) as resp:
             html = resp.read().decode("utf-8", errors="replace").lower()
         if any(marker in html for marker in markers):
             return True, "WordPress markers found in page source"
@@ -324,7 +347,7 @@ def detect_wordpress(url: str) -> Tuple[bool, str]:
 
 def fetch_html(url: str) -> str:
     req = Request(url, headers={"User-Agent": USER_AGENT})
-    with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+    with _open_url(req) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
 
@@ -441,7 +464,7 @@ def check_noindex_discouraged(url: str, html: str) -> Tuple[bool, str]:
     robots_url = urljoin(url, "/robots.txt")
     try:
         req = Request(robots_url, headers={"User-Agent": USER_AGENT})
-        with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+        with _open_url(req) as resp:
             robots = resp.read().decode("utf-8", errors="replace").lower()
         if "disallow: /" in robots:
             return True, "robots.txt contains Disallow: /"
@@ -540,7 +563,7 @@ def _analyze_one_image(img_url: str) -> Dict[str, Any] | None:
         from io import BytesIO
 
         req = Request(img_url, headers={"User-Agent": USER_AGENT})
-        with urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+        with _open_url(req) as resp:
             data = resp.read()
         img = Image.open(BytesIO(data)).convert("L")
         w, h = img.size
