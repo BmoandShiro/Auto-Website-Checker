@@ -450,7 +450,10 @@ class MainWindow(QMainWindow):
         layout.setStretch(14, 0)  # footer
 
         footer_row = QHBoxLayout()
-        self.credit_label = QLabel("Created by: BMOandShiro")
+        self.credit_label = QLabel(
+            'Created by: <a href="https://github.com/BmoandShiro">BMOandShiro</a>'
+        )
+        self.credit_label.setOpenExternalLinks(True)
         self.version_label = QLabel(APP_VERSION)
         footer_row.addWidget(self.credit_label)
         footer_row.addStretch()
