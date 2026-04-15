@@ -68,7 +68,7 @@ DEFAULT_SETTINGS = {
     "ui_theme": "Dark Gray + Blue Accent",
 }
 
-APP_VERSION = "v0.2.0-beta"
+APP_VERSION = "v1.0.0"
 
 
 class SettingsDialog(QDialog):
