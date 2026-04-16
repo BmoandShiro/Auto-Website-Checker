@@ -327,19 +327,73 @@ def discover_internal_pages(seed_url: str, max_pages: int | None = None) -> List
     return pages
 
 
+def _extract_wp_version_from_html(html: str) -> str:
+    # Most reliable public hint: meta generator content="WordPress X.Y.Z".
+    generator = re.search(
+        r'<meta[^>]+name\s*=\s*["\']generator["\'][^>]+content\s*=\s*["\']\s*wordpress\s+([0-9][^"\']*)["\']',
+        html,
+        flags=re.IGNORECASE,
+    )
+    if generator:
+        return generator.group(1).strip()
+
+    # Fallback: WP assets often carry `?ver=` matching core version.
+    asset_ver = re.search(
+        r"/wp-(?:content|includes)/[^\"'>\s]+\?(?:[^\"'>\s]*&)?ver=([0-9]+(?:\.[0-9]+){1,3})",
+        html,
+        flags=re.IGNORECASE,
+    )
+    if asset_ver:
+        return asset_ver.group(1).strip()
+
+    return ""
+
+
+def _extract_wp_version_from_readme(url: str) -> str:
+    readme_url = urljoin(url, "/readme.html")
+    try:
+        req = Request(readme_url, headers={"User-Agent": USER_AGENT})
+        with _open_url(req) as resp:
+            if not (200 <= resp.status < 400):
+                return ""
+            body = resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+    m = re.search(r"Version\s+([0-9]+(?:\.[0-9]+){1,3})", body, flags=re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
 def detect_wordpress(url: str) -> Tuple[bool, str]:
     markers = ["/wp-content/", "/wp-includes/", "wp-json", "wordpress", "wp-"]
     try:
         req = Request(url, headers={"User-Agent": USER_AGENT})
         with _open_url(req) as resp:
-            html = resp.read().decode("utf-8", errors="replace").lower()
+            html_raw = resp.read().decode("utf-8", errors="replace")
+        html = html_raw.lower()
+        version = _extract_wp_version_from_html(html_raw)
+
         if any(marker in html for marker in markers):
-            return True, "WordPress markers found in page source"
+            note = "WordPress markers found in page source"
+            if version:
+                note += f" (version: {version})"
+            else:
+                readme_ver = _extract_wp_version_from_readme(url)
+                if readme_ver:
+                    note += f" (version: {readme_ver})"
+            return True, note
         # Quick probe for common WP endpoint.
         wp_json = urljoin(url, "/wp-json/")
         status = fetch_status(wp_json)
         if 200 <= status < 400:
-            return True, f"wp-json reachable ({status})"
+            note = f"wp-json reachable ({status})"
+            if version:
+                note += f" (version: {version})"
+            else:
+                readme_ver = _extract_wp_version_from_readme(url)
+                if readme_ver:
+                    note += f" (version: {readme_ver})"
+            return True, note
         return False, "No WordPress markers found"
     except Exception:
         return False, "Unable to confirm WordPress markers"

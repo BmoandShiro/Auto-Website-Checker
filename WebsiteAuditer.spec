@@ -1,11 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_data_files
+
+datas = [('settings.json', '.'), ('run-history', 'run-history'), ('assets\\\\app-icon.png', 'assets')]
+datas += collect_data_files('spellchecker')
 
 
 a = Analysis(
     ['gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('settings.json', '.'), ('run-history', 'run-history')],
+    datas=datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,5 +39,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='assets/app-icon.png',
+    icon=['assets\\app-icon.png'],
 )
