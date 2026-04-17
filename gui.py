@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime
+import html
 import json
 import os
 import re
@@ -42,6 +43,7 @@ from PyQt6.QtWidgets import (
     QWidget,
     QSizePolicy,
     QScrollArea,
+    QTextBrowser,
     QTextEdit,
     QToolButton,
 )
@@ -69,6 +71,69 @@ DEFAULT_SETTINGS = {
 }
 
 APP_VERSION = "v1.0.0"
+
+# Match http(s) and www. URLs in free-form notes (trailing punctuation trimmed for the href).
+_URL_IN_PLAIN_TEXT = re.compile(
+    r"(https?://[^\s<>'\"\[\]]+|www\.[^\s<>'\"\[\]]+)",
+    re.IGNORECASE,
+)
+
+# Visible link color in Notes / details / spelling (readable on light and dark table rows).
+_NOTES_LINK_BLUE = "#2563eb"
+
+
+def _format_qa_notes_display(raw: str) -> str:
+    """
+    Normalize spacing and break common QA note patterns onto separate lines
+    (e.g. D: … | M: … | T: …) so the Notes column is easier to scan.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    # Device notes from main.py: "D:… | M:… | T:…"
+    s = re.sub(r"\s*\|\s*(?=[DMT]:\s)", "\n", s)
+    # Long link-failure lists: start next URL on its own line after a semicolon.
+    if len(s) > 140 and s.count("http") >= 2:
+        s = re.sub(r";\s+(?=https?://)", ";\n", s)
+    return s
+
+
+def _linkify_plain_to_html_inline(plain: str) -> str:
+    """Return HTML fragment: escaped text with detected URLs as blue, clickable <a href>. Newlines become <br>."""
+    if not plain:
+        return ""
+    link_style = f"color:{_NOTES_LINK_BLUE};text-decoration:underline;"
+    chunks: list[str] = []
+    pos = 0
+    for m in _URL_IN_PLAIN_TEXT.finditer(plain):
+        chunks.append(html.escape(plain[pos : m.start()]))
+        raw = m.group(0)
+        url = raw
+        while url and url[-1] in ".,);:'\"]>":
+            url = url[:-1]
+        tail = raw[len(url) :]
+        href = ("https://" + url) if url.lower().startswith("www.") else url
+        if href.startswith(("http://", "https://")):
+            chunks.append(
+                f'<a href="{html.escape(href, quote=True)}" style="{link_style}">{html.escape(url)}</a>'
+            )
+        else:
+            chunks.append(html.escape(raw))
+        chunks.append(html.escape(tail))
+        pos = m.end()
+    chunks.append(html.escape(plain[pos:]))
+    return "".join(chunks).replace("\n", "<br>")
+
+
+def _linkify_plain_to_html(plain: str) -> str:
+    """Full document snippet for QTextBrowser (linkify + minimal layout)."""
+    inner = _linkify_plain_to_html_inline(plain)
+    return (
+        '<div style="white-space: pre-wrap; line-height: 1.35;">'
+        f'<style>a {{ color: {_NOTES_LINK_BLUE}; text-decoration: underline; }}</style>'
+        f"{inner}</div>"
+    )
 
 
 class SettingsDialog(QDialog):
@@ -201,7 +266,8 @@ class ProgramInfoDialog(QDialog):
             "------------------------\n"
             "• Y/N — Overall yes/no for that check (TBD = needs a human decision).\n"
             "• Desktop / Mobile / Tablet — Outcome for that viewport profile (Pass / Fail / Manual).\n"
-            "• Notes — Extra detail; device labels are shortened:\n"
+            "• Notes — Extra detail; device labels are shortened (each on its own line when present).\n"
+            "    URLs appear in blue and open in your browser when clicked.\n"
             "    D: = Desktop    M: = Mobile    T: = Tablet\n"
             "  Example: \"D: … | M: … | T: …\" means one note per device type.\n"
             "• Manual — Website Auditer could not finish automatically (often missing Chromium or timeouts).\n"
@@ -217,7 +283,7 @@ class ProgramInfoDialog(QDialog):
             "• Website Auditer only does a quick HTTP check on social URLs and optional name matching.\n"
             "• It cannot prove a profile is the official business account.\n"
             "• \"Conflict\" in notes means two different handles/accounts appeared for the same platform.\n"
-            "• Use the Social links list below the table to open URLs and verify by eye.\n\n"
+            "• Use the Social links list below the table — click a row to open the URL in your browser.\n\n"
             "SPELLING & GRAMMAR\n"
             "------------------\n"
             "• Uses a dictionary heuristic — industry terms and names are often flagged.\n"
@@ -376,7 +442,7 @@ class MainWindow(QMainWindow):
         self.table.cellClicked.connect(self.on_table_cell_clicked)
         layout.addWidget(self.table)
 
-        self.social_label = QLabel("Social links (double-click to open)")
+        self.social_label = QLabel("Social links (click a row to open in browser)")
         self.social_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.social_label)
         self.social_toggle = QToolButton()
@@ -386,13 +452,14 @@ class MainWindow(QMainWindow):
         self.social_toggle.toggled.connect(self.toggle_social_panel)
         layout.addWidget(self.social_toggle)
         self.social_list = QListWidget()
-        self.social_list.itemDoubleClicked.connect(self.open_social_link)
+        self.social_list.itemClicked.connect(self.open_social_link)
         self.social_list.setMinimumHeight(120)
         self.social_list.setVisible(False)
         layout.addWidget(self.social_list)
 
         self.pages_toggle = QToolButton()
         self.pages_toggle.setText("Pages checked \u25be")
+        self.pages_toggle.setToolTip("Expand to see audited URLs; click a row to open in browser.")
         self.pages_toggle.setCheckable(True)
         self.pages_toggle.setChecked(False)
         self.pages_toggle.toggled.connect(self.toggle_pages_panel)
@@ -401,11 +468,12 @@ class MainWindow(QMainWindow):
         self.pages_list = QListWidget()
         self.pages_list.setVisible(False)
         self.pages_list.setMinimumHeight(100)
-        self.pages_list.itemDoubleClicked.connect(self.open_page_link)
+        self.pages_list.itemClicked.connect(self.open_page_link)
         layout.addWidget(self.pages_list)
 
         self.spell_toggle = QToolButton()
         self.spell_toggle.setText("Spelling/grammar unknown words \u25be")
+        self.spell_toggle.setToolTip("Detected http(s) URLs in page lists and context snippets are clickable.")
         self.spell_toggle.setCheckable(True)
         self.spell_toggle.setChecked(False)
         self.spell_toggle.toggled.connect(self.toggle_spell_panel)
@@ -502,7 +570,7 @@ class MainWindow(QMainWindow):
         self._clear_spell_rows()
         self.spell_toggle.setChecked(False)
         self.spell_toggle.setText("Spelling/grammar unknown words \u25be")
-        self.social_label.setText("Social links (double-click to open)")
+        self.social_label.setText("Social links (click a row to open in browser)")
         self.status_label.setText("Running checks... this may take a minute.")
         self.progress_bar.setValue(0)
         self.settings["expected_business_name"] = self.business_name_input.text().strip()
@@ -769,6 +837,24 @@ class MainWindow(QMainWindow):
         pct = int((done / total) * 100)
         self.progress_bar.setValue(max(0, min(100, pct)))
 
+    def _make_notes_qlabel(self, notes_plain: str) -> QLabel:
+        """Rich-text notes: readable line breaks, blue underlined clickable URLs."""
+        lab = QLabel()
+        lab.setObjectName("qa_notes_cell")
+        lab.setWordWrap(True)
+        lab.setTextFormat(Qt.TextFormat.RichText)
+        lab.setOpenExternalLinks(True)
+        lab.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        lab.setContentsMargins(6, 5, 8, 5)
+        formatted = _format_qa_notes_display(notes_plain)
+        body = _linkify_plain_to_html_inline(formatted)
+        lab.setText(f'<div style="line-height:135%;">{body}</div>')
+        lab.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.MinimumExpanding)
+        lab.setStyleSheet(
+            "QLabel#qa_notes_cell { background: transparent; color: palette(window-text); border: none; }"
+        )
+        return lab
+
     def _append_row(self, result: CheckResult) -> None:
         row = asdict(result)
         component_label = f"\u25b8 {row['component']}"
@@ -783,6 +869,9 @@ class MainWindow(QMainWindow):
         row_idx = self.table.rowCount()
         self.table.insertRow(row_idx)
         for col_idx, value in enumerate(values):
+            if col_idx == 5:
+                self.table.setCellWidget(row_idx, col_idx, self._make_notes_qlabel(str(value)))
+                continue
             item = QTableWidgetItem(str(value))
             self._style_result_cell(item, str(value))
             self.table.setItem(row_idx, col_idx, item)
@@ -823,9 +912,11 @@ class MainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, url)
             self.social_list.addItem(item)
         if conflicts:
-            self.social_label.setText(f"Social links (conflicts found: {', '.join(conflicts)})")
+            self.social_label.setText(
+                f"Social links (conflicts: {', '.join(conflicts)} — click a row to open)"
+            )
         else:
-            self.social_label.setText("Social links (double-click to open)")
+            self.social_label.setText("Social links (click a row to open in browser)")
 
     def toggle_social_panel(self, checked: bool) -> None:
         self.social_list.setVisible(checked)
@@ -866,14 +957,31 @@ class MainWindow(QMainWindow):
             wlab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             left.addWidget(wlab)
             if pages:
-                plab = QLabel("Pages: " + "; ".join(str(p) for p in pages[:6]))
+                pages_joined = "; ".join(
+                    _linkify_plain_to_html_inline(str(p)) for p in pages[:6] if str(p).strip()
+                )
+                plab = QLabel()
+                plab.setTextFormat(Qt.TextFormat.RichText)
+                plab.setText(f"Pages: {pages_joined}")
                 plab.setWordWrap(True)
-                plab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                plab.setOpenExternalLinks(True)
+                plab.setTextInteractionFlags(
+                    Qt.TextInteractionFlag.TextBrowserInteraction
+                )
                 left.addWidget(plab)
             if snippets:
-                slab = QLabel("Context: " + " | ".join(f"«{s}»" for s in snippets[:3]))
+                pieces = []
+                for s in snippets[:3]:
+                    inner = _linkify_plain_to_html_inline(str(s))
+                    pieces.append(f"«{inner}»")
+                slab = QLabel()
+                slab.setTextFormat(Qt.TextFormat.RichText)
+                slab.setText("Context: " + " | ".join(pieces))
                 slab.setWordWrap(True)
-                slab.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                slab.setOpenExternalLinks(True)
+                slab.setTextInteractionFlags(
+                    Qt.TextInteractionFlag.TextBrowserInteraction
+                )
                 left.addWidget(slab)
             row_layout.addLayout(left, stretch=1)
             add_btn = QPushButton("Add to dictionary")
@@ -1211,8 +1319,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Load failed", str(exc))
 
     def _is_detail_row(self, row: int) -> bool:
-        item = self.table.item(row, 0)
-        return bool(item and item.data(Qt.ItemDataRole.UserRole) == "detail_row")
+        if row < 0 or row >= self.table.rowCount():
+            return False
+        w = self.table.cellWidget(row, 0)
+        return isinstance(w, QTextBrowser) and w.objectName() == "qa_detail_browser"
 
     def _component_name_for_row(self, row: int) -> str:
         item = self.table.item(row, 0)
@@ -1246,32 +1356,42 @@ class MainWindow(QMainWindow):
         lines.append(f"OK ({len(ok)}):")
         lines.extend(f"- {x}" for x in ok[:200])
         detail_text = "\n".join(lines)
+        detail_text = _format_qa_notes_display(detail_text)
 
         self.table.insertRow(row + 1)
-        detail_item = QTableWidgetItem("   details")
-        detail_item.setData(Qt.ItemDataRole.UserRole, "detail_row")
-        self.table.setItem(row + 1, 0, detail_item)
-        for col in range(1, 5):
-            empty = QTableWidgetItem("")
-            empty.setData(Qt.ItemDataRole.UserRole, "detail_row")
-            self.table.setItem(row + 1, col, empty)
-        notes_item = QTableWidgetItem(detail_text)
-        notes_item.setData(Qt.ItemDataRole.UserRole, "detail_row")
-        self.table.setItem(row + 1, 5, notes_item)
+        self.table.setSpan(row + 1, 0, 1, 6)
+        browser = QTextBrowser()
+        browser.setObjectName("qa_detail_browser")
+        browser.setReadOnly(True)
+        browser.setOpenExternalLinks(True)
+        browser.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        browser.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        browser.setMinimumHeight(120)
+        browser.setMaximumHeight(360)
+        browser.document().setDefaultStyleSheet(
+            f"a {{ text-decoration: underline; color: {_NOTES_LINK_BLUE}; }} "
+            "body { font-size: 12px; line-height: 1.35; }"
+        )
+        browser.setHtml(_linkify_plain_to_html(detail_text))
+        self.table.setCellWidget(row + 1, 0, browser)
         base_item = self.table.item(row, 0)
         if base_item:
             base_item.setText(f"\u25be {component}")
         self.table.resizeRowsToContents()
 
-    def open_social_link(self, item: QListWidgetItem) -> None:
+    def open_social_link(self, item: QListWidgetItem | None) -> None:
+        if item is None:
+            return
         url = item.data(Qt.ItemDataRole.UserRole)
         if url:
-            webbrowser.open(url)
+            webbrowser.open(str(url))
 
-    def open_page_link(self, item: QListWidgetItem) -> None:
+    def open_page_link(self, item: QListWidgetItem | None) -> None:
+        if item is None:
+            return
         url = item.data(Qt.ItemDataRole.UserRole)
         if url:
-            webbrowser.open(url)
+            webbrowser.open(str(url))
 
 def _resolve_app_icon_path() -> str:
     """PyInstaller macOS .app may place data under _MEIPASS or Contents/Resources."""

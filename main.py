@@ -549,6 +549,22 @@ def _load_custom_spell_words(spell: Any, dictionary_path: str) -> None:
         pass
 
 
+# Words with apostrophes (e.g. couldn't) must be one token; \b[a-zA-Z]{4,}\b wrongly matches "couldn".
+_SPELLING_WORD_RE = re.compile(
+    r"\b[a-zA-Z]+(?:['\u2019][a-zA-Z]+)*\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_apostrophes_for_spelling(text: str) -> str:
+    """Map curly/typographic quotes to ASCII apostrophe so contractions tokenize consistently."""
+    return text.replace("\u2019", "'").replace("\u2018", "'").replace("\u201b", "'")
+
+
+def _spelling_letter_count(token: str) -> int:
+    return sum(1 for c in token if c.isalpha())
+
+
 def check_spelling_grammar(
     page_url_html: List[Tuple[str, str]], custom_dictionary_path: str = ""
 ) -> Tuple[bool, str, List[Dict[str, Any]]]:
@@ -568,11 +584,14 @@ def check_spelling_grammar(
     for page_url, html in page_url_html:
         if not html:
             continue
-        text = extract_visible_text(html)
-        for m in re.finditer(r"\b[a-zA-Z]{4,}\b", text):
+        text = _normalize_apostrophes_for_spelling(extract_visible_text(html))
+        for m in _SPELLING_WORD_RE.finditer(text):
             if len(occurrences) >= 8000:
                 break
-            w = m.group(0).lower()
+            raw = m.group(0)
+            if _spelling_letter_count(raw) < 4:
+                continue
+            w = raw.lower()
             snip = text[max(0, m.start() - 35) : min(len(text), m.end() + 35)].strip()
             snip = re.sub(r"\s+", " ", snip)
             occurrences.append((w, page_url, snip))
