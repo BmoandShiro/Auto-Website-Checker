@@ -70,7 +70,7 @@ DEFAULT_SETTINGS = {
     "ui_theme": "Dark Gray + Blue Accent",
 }
 
-APP_VERSION = "v1.0.0"
+APP_VERSION = "v1.0.2"
 
 # Match http(s) and www. URLs in free-form notes (trailing punctuation trimmed for the href).
 _URL_IN_PLAIN_TEXT = re.compile(

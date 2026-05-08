@@ -49,6 +49,7 @@ QA_ROW_OPTIONS = [
     ("social_links", "Social media links out to correct pages"),
     ("business_name", "Using correct business name"),
     ("rise_compat", "Rise Plugin Compatible (Wordpress)"),
+    ("php_version", "PHP Version 7.x or 8.x"),
 ]
 
 
@@ -397,6 +398,43 @@ def detect_wordpress(url: str) -> Tuple[bool, str]:
         return False, "No WordPress markers found"
     except Exception:
         return False, "Unable to confirm WordPress markers"
+
+
+def _extract_php_version_from_text(text: str) -> str:
+    m = re.search(r"\bphp[/\s]+([0-9]+(?:\.[0-9]+){0,2})\b", text, flags=re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
+def detect_php_version(url: str) -> Tuple[bool, str]:
+    try:
+        req = Request(url, headers={"User-Agent": USER_AGENT})
+        with _open_url(req) as resp:
+            headers = resp.headers
+            html_raw = resp.read().decode("utf-8", errors="replace")
+
+        x_powered_by = str(headers.get("X-Powered-By", "")).strip()
+        server_hdr = str(headers.get("Server", "")).strip()
+
+        version = (
+            _extract_php_version_from_text(x_powered_by)
+            or _extract_php_version_from_text(server_hdr)
+            or _extract_php_version_from_text(html_raw)
+        )
+        if not version:
+            return False, "Unable to detect PHP version"
+
+        major_raw = version.split(".", 1)[0]
+        major = int(major_raw)
+        is_supported = major in (7, 8)
+        return (
+            is_supported,
+            (
+                f"Detected PHP version {version}"
+                + (" (supported: 7.x or 8.x)" if is_supported else " (unsupported: expected 7.x or 8.x)")
+            ),
+        )
+    except Exception:
+        return False, "Unable to detect PHP version"
 
 
 def fetch_html(url: str) -> str:
@@ -1186,6 +1224,7 @@ def build_results(
     tablet = audits["tablet"]
     browser_unavailable = "browser unavailable" in desktop.links_note.lower()
     is_wp, wp_note = detect_wordpress(url)
+    php_ok, php_note = detect_php_version(url)
 
     def _fetch_pair(page_url: str) -> Tuple[str, str]:
         try:
@@ -1397,6 +1436,19 @@ def build_results(
             mobile=pf(is_wp),
             tablet=pf(is_wp),
             notes=wp_note,
+        ),
+        rows,
+        )
+        step_progress()
+    if row_enabled("php_version"):
+        emit_row(
+        CheckResult(
+            component="PHP Version 7.x or 8.x",
+            yes_no=yn(php_ok),
+            desktop=pf(php_ok),
+            mobile=pf(php_ok),
+            tablet=pf(php_ok),
+            notes=php_note,
         ),
         rows,
         )
